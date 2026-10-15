@@ -1,0 +1,139 @@
+name: Build AFFY Debug APK
+
+on:
+  push:
+    branches: [ "main" ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create a GitHub Release with APK asset'
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Release Tag (e.g. v1.0.0, defaults to date-tag if blank)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Package Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Prepare Build Environment
+        run: |
+          # Ensure .env file exists with valid keys for Secrets Gradle Plugin
+          if [ ! -f ".env" ]; then
+            if [ -f ".env.example" ]; then
+              cp .env.example .env
+            else
+              echo 'GEMINI_API_KEY=your_gemini_api_key_here' > .env
+            fi
+          fi
+          if ! grep -q "GEMINI_API_KEY" .env; then
+            echo 'GEMINI_API_KEY=your_gemini_api_key_here' >> .env
+          fi
+          
+          # Restore debug keystore from base64 or generate fallback if missing
+          if [ ! -f "debug.keystore" ]; then
+            if [ -f "debug.keystore.base64" ]; then
+              echo "Restoring debug.keystore from debug.keystore.base64..."
+              base64 -d debug.keystore.base64 > debug.keystore 2>/dev/null || base64 --decode debug.keystore.base64 > debug.keystore 2>/dev/null || openssl base64 -d -in debug.keystore.base64 -out debug.keystore 2>/dev/null || true
+            fi
+            if [ ! -f "debug.keystore" ] || [ ! -s "debug.keystore" ]; then
+              echo "Generating standard fallback debug.keystore..."
+              keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+
+      - name: Make Gradle Wrapper Executable
+        run: chmod +x gradlew
+
+      - name: Check Gradle Environment
+        run: ./gradlew --version
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Upload Build Reports on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gradle-Build-Debug-Reports
+          path: |
+            app/build/reports/
+            **/build/reports/
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Verify Generated APK
+        run: |
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          if [ -f "$APK_PATH" ]; then
+            echo "SUCCESS: Debug APK found at $APK_PATH"
+            ls -lh "$APK_PATH"
+          else
+            echo "ERROR: Expected APK not found at $APK_PATH"
+            echo "Listing output directory contents:"
+            ls -la app/build/outputs/apk/debug/ || ls -la app/build/outputs/
+            exit 1
+          fi
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AFFY-Debug-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Determine Release Tag
+        id: vars
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+        run: |
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v1.0.$(date +'%Y%m%d%H%M%S')"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: "AFFY Assistant - ${{ steps.vars.outputs.tag }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
