@@ -45,6 +45,7 @@ object ActionTypes {
     const val SEARCH = "SEARCH"
     const val SEARCH_WEB = "SEARCH_WEB"
     const val CALL_CONTACT = "CALL_CONTACT"
+    const val PHONE_CALL = "PHONE_CALL"
     const val SEND_MESSAGE = "SEND_MESSAGE"
     const val SEND_WHATSAPP_MESSAGE = "SEND_WHATSAPP_MESSAGE"
     const val SEND_SMS = "SEND_SMS"

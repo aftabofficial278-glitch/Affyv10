@@ -36,7 +36,8 @@ data class EmotionalVoiceProfile(
     val pitchMultiplier: Float = 1.0f,
     val speedMultiplier: Float = 1.0f,
     val volumeMultiplier: Float = 1.0f,
-    val emotionalTag: String = "NORMAL"
+    val emotionalTag: String = "NORMAL",
+    val toneInstruction: String = ""
 )
 
 data class EmotionTransitionResult(
@@ -103,19 +104,7 @@ class AffyEmotionEngine private constructor() {
             null
         }
 
-        val toneInstruction = when (newAffyEmotion) {
-            AffyEmotion.SLIGHTLY_HURT -> "Speak softly, politely, with a slightly subdued and hurt/naraz tone. Avoid being defensive or rude."
-            AffyEmotion.NARAZ_COLD -> "Speak in a reserved, slightly cold, brief and serious tone, showing you are a bit upset."
-            AffyEmotion.FIRM_SERIOUS -> "Speak in a firm, serious, composed and controlled tone without being abusive or insulting."
-            AffyEmotion.WARM_HAPPY -> "Speak warmly, cheerfully, showing genuine friendly affection, sweetness, and happiness."
-            AffyEmotion.FLIRTY_PLAYFUL -> "Speak in a playful, charming, teasing and warm voice with natural wit and confidence."
-            AffyEmotion.ENERGETIC -> "Speak enthusiastically, with high energy, excitement, and an upbeat spirit."
-            AffyEmotion.CARING_CONCERNED -> "Speak gently, softly, empathetically, showing deep care, supportive comfort, and warmth."
-            AffyEmotion.PLAYFUL_AMUSED -> "Speak with a light, warm, amused tone and a natural cheerful chuckle or 'haha'."
-            AffyEmotion.SURPRISED_CURIOUS -> "Speak with genuine curiosity and natural surprise ('ohh', 'aray', 'sach mein?')."
-            AffyEmotion.NORMAL -> "Speak naturally, in a friendly, confident, helpful companion tone with natural conversational fillers."
-            AffyEmotion.SAD_SOFT -> "Speak gently, softly, with quiet empathy and tender warmth."
-        }
+        val toneInstruction = getToneInstruction(newAffyEmotion)
 
         return EmotionTransitionResult(
             detectedUserEmotion = userEmotion,
@@ -501,8 +490,24 @@ class AffyEmotionEngine private constructor() {
         }
     }
 
-    fun getEmotionalVoiceProfile(emotion: AffyEmotion, voiceName: String): EmotionalVoiceProfile {
+    fun getToneInstruction(emotion: AffyEmotion): String {
         return when (emotion) {
+            AffyEmotion.SLIGHTLY_HURT -> "Speak softly, politely, with a slightly subdued and hurt/naraz tone. Avoid being defensive or rude."
+            AffyEmotion.NARAZ_COLD -> "Speak in a reserved, slightly cold, brief and serious tone, showing you are a bit upset."
+            AffyEmotion.FIRM_SERIOUS -> "Speak in a firm, serious, composed and controlled tone without being abusive or insulting."
+            AffyEmotion.WARM_HAPPY -> "Speak warmly, cheerfully, showing genuine friendly affection, sweetness, and happiness."
+            AffyEmotion.FLIRTY_PLAYFUL -> "Speak in a playful, charming, teasing and warm voice with natural wit and confidence."
+            AffyEmotion.ENERGETIC -> "Speak enthusiastically, with high energy, excitement, and an upbeat spirit."
+            AffyEmotion.CARING_CONCERNED -> "Speak gently, softly, empathetically, showing deep care, supportive comfort, and warmth."
+            AffyEmotion.PLAYFUL_AMUSED -> "Speak with a light, warm, amused tone and a natural cheerful chuckle or 'haha'."
+            AffyEmotion.SURPRISED_CURIOUS -> "Speak with genuine curiosity and natural surprise ('ohh', 'aray', 'sach mein?')."
+            AffyEmotion.NORMAL -> "Speak naturally, in a friendly, confident, helpful companion tone with natural conversational fillers."
+            AffyEmotion.SAD_SOFT -> "Speak gently, softly, with quiet empathy and tender warmth."
+        }
+    }
+
+    fun getEmotionalVoiceProfile(emotion: AffyEmotion, voiceName: String): EmotionalVoiceProfile {
+        val baseProfile = when (emotion) {
             AffyEmotion.WARM_HAPPY -> EmotionalVoiceProfile(pitchMultiplier = 1.05f, speedMultiplier = 1.02f, volumeMultiplier = 1.0f, emotionalTag = "WARM_HAPPY")
             AffyEmotion.FLIRTY_PLAYFUL -> EmotionalVoiceProfile(pitchMultiplier = 1.08f, speedMultiplier = 0.98f, volumeMultiplier = 0.95f, emotionalTag = "FLIRTY_PLAYFUL")
             AffyEmotion.ENERGETIC -> EmotionalVoiceProfile(pitchMultiplier = 1.12f, speedMultiplier = 1.10f, volumeMultiplier = 1.0f, emotionalTag = "ENERGETIC")
@@ -515,6 +520,7 @@ class AffyEmotionEngine private constructor() {
             AffyEmotion.SAD_SOFT -> EmotionalVoiceProfile(pitchMultiplier = 0.92f, speedMultiplier = 0.88f, volumeMultiplier = 0.80f, emotionalTag = "SAD_SOFT")
             AffyEmotion.NORMAL -> EmotionalVoiceProfile()
         }
+        return baseProfile.copy(toneInstruction = getToneInstruction(emotion))
     }
 
     fun reset() {
