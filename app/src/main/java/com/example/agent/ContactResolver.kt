@@ -56,27 +56,10 @@ class ContactResolver(private val context: Context) {
         fun cleanContactQuery(query: String): String {
             var text = query.trim()
             text = text.replace(
-                Regex("(?i)\\b(affy|please|call karo|call lagao|call milao|call kar do|call laga do|call mila do|call kr do|call krdo|call kr|call kro|phone karo|phone lagao|phone kar do|phone kr do|phone krdo|phone kr|phone kro|ko call kr|ko call karo|ko call lagao|ko call milao|ko phone kr|ko phone karo|ko call|ko phone|call|phone|dial|karo|kar do|kardo|kr do|krdo|kr|kro|kar|lagao|laga do|lagade|laga dena|milao|mila do|mila de|mila dena|karna|lagana|ko bolta ho|ko bolta|ko bolo|bolta ho|bolta|bol do|bolo|se baat karao|se baat karwao|baat karao|baat karwao|whatsapp karo|whatsapp kar do|whatsapp kr do|whatsapp krdo|whatsapp kr|whatsapp kro|whatsapp bhejo|whatsapp bhej do|whatsapp pe|whatsapp par|whatsapp|msg karo|msg kar do|msg kr do|msg krdo|msg kr|msg kro|msg bhejo|msg bhej do|message karo|message kar do|message kr do|message krdo|message kr|message kro|message bhejo|message bhej do|msg|message|text karo|text kar do|text kr do|text kr|text|bhejo|bhej do|send karo|send kar do|send kr do|send kr|send|likho|likh do|bol do|ko|pe|par|se)\\b"),
+                Regex("(?i)\\b(affy|please|call karo|call lagao|call milao|call kar do|call laga do|call mila do|phone karo|phone lagao|phone kar do|ko call|ko phone|call|phone|dial|karo|kar do|lagao|laga do|milao|mila do|karna|lagana|ko|pe|par|whatsapp karo|whatsapp kar do|whatsapp bhejo|whatsapp bhej do|whatsapp pe|whatsapp par|whatsapp|msg karo|msg kar do|msg bhejo|msg bhej do|message karo|message kar do|message bhejo|message bhej do|msg|message|text karo|text kar do|text|bhejo|bhej do|send karo|send kar do|send|likho|likh do|bol do)\\b"),
                 " "
             )
             return text.replace(Regex("\\s+"), " ").trim()
-        }
-
-        fun levenshteinDistance(s1: String, s2: String): Int {
-            if (s1 == s2) return 0
-            if (s1.isEmpty()) return s2.length
-            if (s2.isEmpty()) return s1.length
-            val dp = IntArray(s2.length + 1) { it }
-            for (i in 1..s1.length) {
-                var prev = dp[0]
-                dp[0] = i
-                for (j in 1..s2.length) {
-                    val temp = dp[j]
-                    dp[j] = if (s1[i - 1] == s2[j - 1]) prev else 1 + minOf(prev, dp[j], dp[j - 1])
-                    prev = temp
-                }
-            }
-            return dp[s2.length]
         }
 
         /**
@@ -304,8 +287,7 @@ class ContactResolver(private val context: Context) {
         val exactFullMatches = mutableListOf<ContactCandidate>()
         val exactWordMatches = mutableListOf<ContactCandidate>()
         val allWordsMatches = mutableListOf<ContactCandidate>()
-        val prefixWordMatches = mutableListOf<ContactCandidate>()
-        val fuzzyMatches = mutableListOf<ContactCandidate>()
+        val substringMatches = mutableListOf<ContactCandidate>()
 
         if (isSelfQuery) {
             val selfKeywords = listOf("me", "myself", "my number", "you", "apna", "personal", "owner", "mera")
@@ -327,18 +309,10 @@ class ContactResolver(private val context: Context) {
                 exactFullMatches.add(candidate)
             } else if (candTokens.contains(cleanQuery)) {
                 exactWordMatches.add(candidate)
-            } else if (queryWords.size > 1 && queryWords.all { qw -> candTokens.any { it == qw || it.startsWith(qw) } }) {
+            } else if (queryWords.isNotEmpty() && queryWords.all { qw -> candTokens.any { it == qw || it.startsWith(qw) } }) {
                 allWordsMatches.add(candidate)
-            } else if (cleanQuery.length >= 3 && candTokens.any { it.startsWith(cleanQuery) }) {
-                prefixWordMatches.add(candidate)
-            } else if (cleanQuery.length >= 4 && queryWords.size == 1) {
-                val isFuzzy = candTokens.any { token ->
-                    val dist = levenshteinDistance(cleanQuery, token)
-                    (cleanQuery.length in 4..6 && dist <= 1) || (cleanQuery.length >= 7 && dist <= 2)
-                } || (candNormName.length >= 4 && levenshteinDistance(cleanQuery, candNormName) <= 1)
-                if (isFuzzy) {
-                    fuzzyMatches.add(candidate)
-                }
+            } else if (candNormName.contains(cleanQuery) || cleanQuery.contains(candNormName)) {
+                substringMatches.add(candidate)
             }
         }
 
@@ -346,11 +320,10 @@ class ContactResolver(private val context: Context) {
             exactFullMatches.isNotEmpty() -> exactFullMatches
             exactWordMatches.isNotEmpty() -> exactWordMatches
             allWordsMatches.isNotEmpty() -> allWordsMatches
-            prefixWordMatches.isNotEmpty() -> prefixWordMatches
-            else -> fuzzyMatches
+            else -> substringMatches
         }
 
-        Log.i(TAG, "[WA_CONTACT_MATCHES] query='$cleanQuery' exactFull=${exactFullMatches.size} exactWord=${exactWordMatches.size} allWords=${allWordsMatches.size} prefix=${prefixWordMatches.size} fuzzy=${fuzzyMatches.size} selectedPool=${poolToUse.size}")
+        Log.i(TAG, "[WA_CONTACT_MATCHES] query='$cleanQuery' exactFull=${exactFullMatches.size} exactWord=${exactWordMatches.size} allWords=${allWordsMatches.size} substring=${substringMatches.size} selectedPool=${poolToUse.size}")
 
         if (poolToUse.isEmpty()) {
             AffyDiagnostics.logContactStage(

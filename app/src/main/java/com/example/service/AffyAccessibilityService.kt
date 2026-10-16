@@ -38,14 +38,6 @@ class AffyAccessibilityService : AccessibilityService() {
         var instance: AffyAccessibilityService? = null
             private set
 
-        fun getInstance(): AffyAccessibilityService? = instance
-
-        @Volatile
-        var lastNotificationTimestamp: Long = 0L
-
-        @Volatile
-        var lastNotificationText: String = ""
-
         private val _isServiceConnected = MutableStateFlow(false)
         val isServiceConnected: StateFlow<Boolean> = _isServiceConnected.asStateFlow()
 
@@ -889,7 +881,7 @@ class AffyAccessibilityService : AccessibilityService() {
             return "Screen par koi visible chat ya contact list nahi mila."
         }
 
-        return "Screen par is waqt ${chatEntries.size} contacts aur chats visible hain:\n" + chatEntries.take(10).mapIndexed { idx, it -> "${idx + 1}. $it" }.joinToString("\n")
+        return "Samne yeh chats aur contacts visible hain:\n" + chatEntries.take(8).map { "• $it" }.joinToString("\n")
     }
 
     /**
@@ -1023,12 +1015,7 @@ class AffyAccessibilityService : AccessibilityService() {
         Log.i(TAG, "[SCREEN_MESSAGE_NODES] Extracted ${visibleMessages.size} visible messages: $visibleMessages")
 
         if (visibleMessages.isEmpty() && chatTitle.isNullOrBlank()) {
-            val visibleChats = readVisibleChatList()
-            return if (!visibleChats.isNullOrBlank() && !visibleChats.contains("nahi mila")) {
-                "Abhi chat list screen open hai, koi specific chat open nahi hai.\n$visibleChats\nAap kisi contact ki chat open karne ko kahein (jaise 'Ali ki chat open karo')."
-            } else {
-                "Screen par koi readable message visible nahi mila."
-            }
+            return "Screen par koi readable message visible nahi mila."
         }
 
         val titleHeader = if (!chatTitle.isNullOrBlank()) "Chat with $chatTitle" else "Current Screen Chat"
@@ -1037,119 +1024,6 @@ class AffyAccessibilityService : AccessibilityService() {
         } else {
             "$titleHeader open hai magar is chat mein koi message text visible nahi hai."
         }
-    }
-
-    /**
-     * Extracts active conversation contact/header title if inside an open chat conversation.
-     */
-    fun getChatHeaderTitle(): String? {
-        val root = rootInActiveWindow ?: return null
-        var foundTitle: String? = null
-        fun findHeader(node: AccessibilityNodeInfo, depth: Int) {
-            if (depth > 20 || foundTitle != null) return
-            val id = node.viewIdResourceName?.lowercase() ?: ""
-            val text = node.text?.toString()?.trim() ?: ""
-            val isHeaderId = id.endsWith(":id/conversation_contact_name") ||
-                    id.endsWith(":id/chat_title") ||
-                    id.endsWith(":id/action_bar_title") ||
-                    id.endsWith(":id/conversation_title")
-            if (isHeaderId && text.isNotBlank() && !text.equals("WhatsApp", ignoreCase = true)) {
-                foundTitle = text
-                return
-            }
-            for (i in 0 until node.childCount) {
-                val child = node.getChild(i) ?: continue
-                findHeader(child, depth + 1)
-            }
-        }
-        findHeader(root, 0)
-        return foundTitle
-    }
-
-    /**
-     * Interacts with WhatsApp or messaging screen to locate and click/open a specific contact's chat.
-     */
-    fun openChatByContactName(contactName: String): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val cleanTarget = contactName.lowercase().trim()
-        if (cleanTarget.isBlank()) return false
-
-        // 1. If chat with contact is already open
-        val currentTitle = getChatHeaderTitle()?.lowercase()
-        if (currentTitle != null && (currentTitle.contains(cleanTarget) || cleanTarget.contains(currentTitle))) {
-            Log.i(TAG, "[OPEN_CHAT] Chat with '$contactName' is already open.")
-            return true
-        }
-
-        // 2. Search visible conversation rows / contact items on screen
-        var targetNodeToClick: AccessibilityNodeInfo? = null
-
-        fun findContactNode(node: AccessibilityNodeInfo, depth: Int) {
-            if (depth > 20 || targetNodeToClick != null) return
-            val text = node.text?.toString()?.trim() ?: ""
-            val desc = node.contentDescription?.toString()?.trim() ?: ""
-            val id = node.viewIdResourceName?.lowercase() ?: ""
-
-            val normText = text.lowercase()
-            val normDesc = desc.lowercase()
-
-            val isMatch = normText == cleanTarget ||
-                    (cleanTarget.length >= 3 && normText.startsWith(cleanTarget)) ||
-                    (cleanTarget.length >= 3 && normText.contains(cleanTarget)) ||
-                    normDesc.contains("chat with $cleanTarget") ||
-                    normDesc.startsWith(cleanTarget)
-
-            if (isMatch && text.isNotBlank()) {
-                val ignored = listOf("search", "chats", "updates", "status", "communities", "calls", "new chat", "unread", "archived", "camera", "whatsapp")
-                if (ignored.none { normText.equals(it) }) {
-                    targetNodeToClick = node
-                    return
-                }
-            }
-
-            for (i in 0 until node.childCount) {
-                val child = node.getChild(i) ?: continue
-                findContactNode(child, depth + 1)
-            }
-        }
-
-        findContactNode(root, 0)
-
-        targetNodeToClick?.let { node ->
-            val clicked = clickNodeWithFallback(node)
-            Log.i(TAG, "[OPEN_CHAT] Clicked visible contact row for '$contactName': success=$clicked")
-            if (clicked) return true
-        }
-
-        // 3. Fallback: Search via WhatsApp Search Icon
-        val searchClicked = clickElementUniversal("search") || clickElementByViewId("menuitem_search") || clickElementByText("Search")
-        if (searchClicked) {
-            android.os.SystemClock.sleep(350)
-            val inputSuccess = typeText(contactName)
-            if (inputSuccess) {
-                android.os.SystemClock.sleep(700)
-                val updatedRoot = rootInActiveWindow ?: return true
-                var searchResultNode: AccessibilityNodeInfo? = null
-                fun findSearchResult(node: AccessibilityNodeInfo, depth: Int) {
-                    if (depth > 20 || searchResultNode != null) return
-                    val t = node.text?.toString()?.trim()?.lowercase() ?: ""
-                    val d = node.contentDescription?.toString()?.trim()?.lowercase() ?: ""
-                    if ((t.contains(cleanTarget) || d.contains(cleanTarget)) && !t.contains("...") && !node.isEditable) {
-                        searchResultNode = node
-                        return
-                    }
-                    for (i in 0 until node.childCount) {
-                        val child = node.getChild(i) ?: continue
-                        findSearchResult(child, depth + 1)
-                    }
-                }
-                findSearchResult(updatedRoot, 0)
-                searchResultNode?.let { return clickNodeWithFallback(it) }
-                return true
-            }
-        }
-
-        return false
     }
 
     /**

@@ -121,7 +121,6 @@ class AffyActionExecutor(
             ActionTypes.READ_NOTIFICATION -> handleReadNotifications(action.target)
             ActionTypes.READ_VISIBLE_CHATS -> handleReadVisibleChats()
             ActionTypes.READ_SCREEN_MESSAGES -> handleReadScreenMessages()
-            ActionTypes.OPEN_CHAT -> handleOpenChat(action.target)
             ActionTypes.HANDLE_CHAT_AUTHORIZATION -> handleAuthorizeChat(action.target ?: "")
             ActionTypes.REVOKE_CHAT_AUTHORIZATION -> handleRevokeChat(action.target)
             ActionTypes.REMEMBER_FACT -> handleRememberFact(action.value ?: action.text ?: action.target ?: "")
@@ -1176,39 +1175,6 @@ class AffyActionExecutor(
         }
     }
 
-    private suspend fun handleOpenChat(contactName: String?): ActionResult {
-        if (contactName.isNullOrBlank()) {
-            return ActionResult(false, "No contact specified", "Kiski chat open karni hai?")
-        }
-        val cleanName = ContactResolver.cleanContactQuery(contactName).ifBlank { contactName.trim() }
-        val service = AffyAccessibilityService.instance
-        if (service == null) {
-            return ActionResult(false, "Accessibility inactive", "Screen access karne ke liye Accessibility enable karni hogi.")
-        }
-        val opened = service.openChatByContactName(cleanName)
-        if (opened) {
-            visionEngine.waitForMeaningfulChange(1200)
-            return ActionResult(true, "Opened chat for $cleanName", "$cleanName ki chat open kar di hai boss.")
-        } else {
-            val res = contactResolver.resolveContact(cleanName)
-            if (res is ContactResolutionResult.Single) {
-                val cleanPhone = res.phoneNumber.replace(Regex("[^0-9]"), "")
-                val targetPkg = WhatsAppInstanceManager.resolveOutgoingInstance(context) ?: WhatsAppInstanceManager.PKG_WHATSAPP
-                try {
-                    val uri = Uri.parse("https://api.whatsapp.com/send?phone=$cleanPhone")
-                    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
-                        `package` = targetPkg
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                    }
-                    context.startActivity(intent)
-                    visionEngine.waitForMeaningfulChange(1500)
-                    return ActionResult(true, "Opened chat for ${res.name}", "${res.name} ki WhatsApp chat open kar di hai.")
-                } catch (_: Exception) {}
-            }
-            return ActionResult(false, "Chat not found", "Screen par $cleanName ki chat nahi mili.")
-        }
-    }
-
     private fun handleAuthorizeChat(target: String): ActionResult {
         val notifAssistant = AffyNotificationAssistant.getInstance(context)
         val cleanTarget = target.trim()
@@ -1900,17 +1866,9 @@ class AffyActionExecutor(
 
         val foregroundPkg = AffyAccessibilityService.currentAppPackage.value ?: ""
         if (WhatsAppInstanceManager.isWhatsAppPackage(foregroundPkg) || foregroundPkg.contains("messaging") || foregroundPkg.contains("mms")) {
-            val headerTitle = service.getChatHeaderTitle()
-            if (!headerTitle.isNullOrBlank()) {
-                val chatMessages = service.readVisibleChatMessages()
-                if (!chatMessages.isNullOrBlank()) {
-                    return ActionResult(true, "Read visible chat", chatMessages)
-                }
-            } else {
-                val chatList = service.readVisibleChatList()
-                if (!chatList.isNullOrBlank() && !chatList.contains("nahi mila")) {
-                    return ActionResult(true, "Read visible chat list", chatList)
-                }
+            val chatMessages = service.readVisibleChatMessages()
+            if (!chatMessages.isNullOrBlank()) {
+                return ActionResult(true, "Read visible chat", chatMessages)
             }
         }
 

@@ -67,38 +67,6 @@ class AffyEnvironmentObserver(
                 verifyWhatsAppOutcome(step.target, accessibility)
             }
 
-            ActionTypes.CHATGPT_GENERATE_IMAGE -> {
-                val wf = com.example.agent.AffyConversationContextManager.getInstance().getActiveTaskWorkflow()
-                val submitted = wf != null && (wf.stage == com.example.agent.WorkflowStage.PROMPT_SUBMITTED ||
-                        wf.stage == com.example.agent.WorkflowStage.GENERATING_IMAGE ||
-                        wf.stage == com.example.agent.WorkflowStage.IMAGE_READY)
-                VerificationResult(
-                    isVerified = submitted,
-                    observation = wf?.lastObservedStatus ?: "ChatGPT prompt submission checked.",
-                    failureReason = if (!submitted) (wf?.lastObservedStatus ?: "ChatGPT prompt submission could not be verified on screen.") else null
-                )
-            }
-
-            ActionTypes.DOWNLOAD_CHATGPT_IMAGE -> {
-                val wf = com.example.agent.AffyConversationContextManager.getInstance().getActiveTaskWorkflow()
-                val downloaded = wf != null && wf.stage == com.example.agent.WorkflowStage.IMAGE_DOWNLOADED
-                VerificationResult(
-                    isVerified = downloaded,
-                    observation = wf?.lastObservedStatus ?: "ChatGPT image download verification checked.",
-                    failureReason = if (!downloaded) (wf?.lastObservedStatus ?: "Download status message could not be verified.") else null
-                )
-            }
-
-            ActionTypes.SET_WALLPAPER -> {
-                val wf = com.example.agent.AffyConversationContextManager.getInstance().getActiveTaskWorkflow()
-                val applied = wf != null && wf.stage == com.example.agent.WorkflowStage.WALLPAPER_APPLIED
-                VerificationResult(
-                    isVerified = applied,
-                    observation = wf?.lastObservedStatus ?: "Wallpaper application verification checked.",
-                    failureReason = if (!applied) (wf?.lastObservedStatus ?: "Wallpaper application could not be verified.") else null
-                )
-            }
-
             ActionTypes.CHECK_GMAIL, ActionTypes.READ_GMAIL, "CHECK_ATTACHMENT" -> {
                 VerificationResult(
                     isVerified = true,

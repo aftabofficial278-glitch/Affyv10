@@ -235,23 +235,13 @@ data class ScreenContext(
             sb.append("Aap abhi $appDisplayName mein hain. ")
         }
 
-        if (foregroundPackage.contains("whatsapp", ignoreCase = true) || appDisplayName.contains("whatsapp", ignoreCase = true)) {
-            val contactRows = visualRows
-                .map { it.primaryLabel.trim() }
-                .filter { it.isNotBlank() && it.length in 2..35 && !it.equals("WhatsApp", ignoreCase = true) && !it.equals("Chats", ignoreCase = true) && !it.equals("Updates", ignoreCase = true) && !it.equals("Calls", ignoreCase = true) && !it.equals("Search", ignoreCase = true) }
-                .distinct()
-            if (contactRows.isNotEmpty()) {
-                sb.append("Screen par ${contactRows.size} contacts/chats visible hain: ${contactRows.take(6).joinToString(", ")}. ")
-            }
-        }
-
         if (errorMessage != null) {
             sb.append("Screen par ek error ya alert hai: \"$errorMessage\". ")
         } else if (loadingDetected) {
             sb.append("Screen par loading ho rahi hai. ")
         }
 
-        if (visualRows.isNotEmpty() && !foregroundPackage.contains("whatsapp", ignoreCase = true)) {
+        if (visualRows.isNotEmpty()) {
             val keyRows = visualRows
                 .map { it.primaryLabel.trim() }
                 .filter { it.isNotBlank() && it.length < 35 }

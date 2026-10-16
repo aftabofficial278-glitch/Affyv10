@@ -79,11 +79,6 @@ import com.example.ui.components.OnboardingDialog
 import com.example.ui.components.PermissionsSheet
 import com.example.ui.components.SettingsSheet
 import com.example.ui.theme.AmberThinking
-import com.example.ui.theme.CosmicBlueAccent
-import com.example.ui.theme.CosmicGoldDeep
-import com.example.ui.theme.CosmicGoldLight
-import com.example.ui.theme.CosmicGoldPrimary
-import com.example.ui.theme.CosmicGoldWarm
 import com.example.ui.theme.CrimsonError
 import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.CyanCore
@@ -203,27 +198,36 @@ fun AffyMainScreen(
         label = "mic_pulse_scale"
     )
 
-    // Full-Screen Edge-to-Edge Immersive 3D Golden Universe Canvas
+    // Main Minimalistic Futuristic Jarvis Canvas
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF04060C)),
+            .background(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        Color(0xFF0F172A),
+                        Color(0xFF050811),
+                        Color(0xFF000000)
+                    ),
+                    radius = 1400f
+                )
+            )
+            .statusBarsPadding()
+            .navigationBarsPadding(),
         contentAlignment = Alignment.Center
     ) {
-        // 1. FULL-SCREEN HOLOGRAPHIC CHAIR PRESENCE (Edge-to-Edge)
+        // FULL-SCREEN LIVING HOLOGRAPHIC AFFY CHARACTER (Frameless, integrated into HUD)
         AffyHologramPresence(
             state = uiState.state,
             amplitude = uiState.audioAmplitude,
-            modifier = Modifier.fillMaxSize(),
-            onClick = { handleMicToggle() }
+            modifier = Modifier.fillMaxSize()
         )
 
-        // 3. TOP HUD BAR (Respects statusBar insets while universe bleeds behind it)
+        // TOP HUD BAR
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
-                .statusBarsPadding()
                 .padding(horizontal = 20.dp, vertical = 14.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
@@ -239,8 +243,7 @@ fun AffyMainScreen(
                     modifier = Modifier
                         .size(38.dp)
                         .clip(CircleShape)
-                        .background(Color(0xCC0D1322))
-                        .border(1.dp, CosmicGoldPrimary.copy(alpha = 0.25f), CircleShape)
+                        .background(Color(0xFF131C2E))
                         .testTag("accessibility_status_icon")
                 ) {
                     Icon(
@@ -257,14 +260,13 @@ fun AffyMainScreen(
                     modifier = Modifier
                         .size(38.dp)
                         .clip(CircleShape)
-                        .background(Color(0xCC0D1322))
-                        .border(1.dp, CosmicGoldPrimary.copy(alpha = 0.25f), CircleShape)
+                        .background(Color(0xFF131C2E))
                         .testTag("voice_service_icon")
                 ) {
                     Icon(
                         imageVector = Icons.Default.GraphicEq,
                         contentDescription = "Voice Engine",
-                        tint = if (backgroundListening) CosmicGoldPrimary else TextMuted,
+                        tint = if (backgroundListening) CyanCore else TextMuted,
                         modifier = Modifier.size(18.dp)
                     )
                 }
@@ -273,8 +275,8 @@ fun AffyMainScreen(
             // Center Futuristic Brand Pill
             Surface(
                 shape = RoundedCornerShape(16.dp),
-                color = Color(0xCC0D1322),
-                border = androidx.compose.foundation.BorderStroke(1.dp, CosmicGoldPrimary.copy(alpha = 0.42f)),
+                color = Color(0xFF131C2E).copy(alpha = 0.7f),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E293B)),
                 modifier = Modifier.clickable { viewModel.openWelcomeScreen() }
             ) {
                 Row(
@@ -288,13 +290,13 @@ fun AffyMainScreen(
                             .clip(CircleShape)
                             .background(
                                 when (uiState.state) {
-                                    AffyState.IDLE -> CosmicGoldPrimary
-                                    AffyState.CONNECTING -> CyanCore
+                                    AffyState.IDLE -> CyanCore
+                                    AffyState.CONNECTING -> Color(0xFF00E5FF)
                                     AffyState.LISTENING -> CyanAccent
-                                    AffyState.THINKING -> NeonViolet
-                                    AffyState.SPEAKING -> CosmicGoldLight
+                                    AffyState.THINKING -> AmberThinking
+                                    AffyState.SPEAKING -> NeonViolet
                                     AffyState.EXECUTING -> EmeraldActive
-                                    AffyState.VERIFYING -> CyanCore
+                                    AffyState.VERIFYING -> Color(0xFF00E5FF)
                                     AffyState.ERROR -> CrimsonError
                                 }
                             )
@@ -304,7 +306,7 @@ fun AffyMainScreen(
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
                         letterSpacing = 2.sp,
-                        color = CosmicGoldLight
+                        color = Color.White
                     )
                 }
             }
@@ -320,14 +322,13 @@ fun AffyMainScreen(
                     modifier = Modifier
                         .size(38.dp)
                         .clip(CircleShape)
-                        .background(Color(0xCC0D1322))
-                        .border(1.dp, CosmicGoldPrimary.copy(alpha = 0.25f), CircleShape)
+                        .background(Color(0xFF131C2E))
                         .testTag("about_affy_button")
                 ) {
                     Icon(
                         imageVector = Icons.Default.SmartToy,
                         contentDescription = "About AFFY Capabilities",
-                        tint = CosmicGoldPrimary,
+                        tint = CyanAccent,
                         modifier = Modifier.size(18.dp)
                     )
                 }
@@ -338,8 +339,7 @@ fun AffyMainScreen(
                     modifier = Modifier
                         .size(38.dp)
                         .clip(CircleShape)
-                        .background(Color(0xCC0D1322))
-                        .border(1.dp, CosmicGoldPrimary.copy(alpha = 0.25f), CircleShape)
+                        .background(Color(0xFF131C2E))
                         .testTag("developer_profile_button")
                 ) {
                     Icon(
@@ -356,26 +356,38 @@ fun AffyMainScreen(
                     modifier = Modifier
                         .size(38.dp)
                         .clip(CircleShape)
-                        .background(Color(0xCC0D1322))
-                        .border(1.dp, CosmicGoldPrimary.copy(alpha = 0.25f), CircleShape)
+                        .background(Color(0xFF131C2E))
                         .testTag("settings_button")
                 ) {
                     Icon(
                         imageVector = Icons.Default.Settings,
                         contentDescription = "AFFY Settings",
-                        tint = CosmicGoldWarm,
+                        tint = CyanCore,
                         modifier = Modifier.size(18.dp)
                     )
                 }
             }
         }
 
-        // 4. LOWER HERO: STATE PILL & DYNAMIC CONVERSATIONAL SUBTITLES
+        // FLOATING AI ORB DIRECTLY ABOVE AFFY'S HEAD
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 76.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            AffyAiCoreOrb(
+                state = uiState.state,
+                amplitude = uiState.audioAmplitude,
+                onClick = { handleMicToggle() }
+            )
+        }
+
+        // CENTER / LOWER HERO: STATE PILL & DYNAMIC CONVERSATIONAL SUBTITLES
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
                 .padding(bottom = 120.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
@@ -393,20 +405,20 @@ fun AffyMainScreen(
             }
 
             val stateColor = when {
-                uiState.state == AffyState.CONNECTING -> CyanCore
+                uiState.state == AffyState.CONNECTING -> Color(0xFF00E5FF)
                 uiState.state == AffyState.LISTENING -> CyanAccent
-                uiState.state == AffyState.THINKING -> NeonViolet
-                uiState.state == AffyState.SPEAKING -> CosmicGoldPrimary
+                uiState.state == AffyState.THINKING -> AmberThinking
+                uiState.state == AffyState.SPEAKING -> NeonViolet
                 uiState.state == AffyState.EXECUTING -> EmeraldActive
-                uiState.state == AffyState.VERIFYING -> CyanCore
+                uiState.state == AffyState.VERIFYING -> Color(0xFF00E5FF)
                 uiState.state == AffyState.ERROR -> CrimsonError
-                else -> CosmicGoldWarm
+                else -> TextSecondary
             }
 
             Surface(
                 shape = RoundedCornerShape(20.dp),
-                color = Color(0xD90A0E1A),
-                border = androidx.compose.foundation.BorderStroke(1.dp, stateColor.copy(alpha = 0.55f)),
+                color = Color(0xFF10192A).copy(alpha = 0.85f),
+                border = androidx.compose.foundation.BorderStroke(1.dp, stateColor.copy(alpha = 0.4f)),
                 modifier = Modifier.padding(bottom = 14.dp)
             ) {
                 Text(
@@ -437,8 +449,8 @@ fun AffyMainScreen(
                     val isError = uiState.errorMessage != null
                     Surface(
                         shape = RoundedCornerShape(16.dp),
-                        color = if (isError) CrimsonError.copy(alpha = 0.18f) else Color(0xE60A101E),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, if (isError) CrimsonError.copy(alpha = 0.65f) else CosmicGoldPrimary.copy(alpha = 0.35f)),
+                        color = if (isError) CrimsonError.copy(alpha = 0.15f) else Color(0xFF0C1424).copy(alpha = 0.9f),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, if (isError) CrimsonError.copy(alpha = 0.6f) else Color(0xFF1E293B)),
                         modifier = Modifier
                             .fillMaxWidth(0.88f)
                             .padding(horizontal = 16.dp)
@@ -484,11 +496,10 @@ fun AffyMainScreen(
             }
         }
 
-        // 5. BOTTOM ONE-TAP MIC TRIGGER & CONTROL DOCK
+        // BOTTOM ONE-TAP MIC TRIGGER & CONTROL DOCK
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
                 .padding(bottom = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(14.dp)
@@ -522,7 +533,7 @@ fun AffyMainScreen(
                             .fillMaxSize()
                             .scale(micPulseScale + (uiState.audioAmplitude * 0.25f))
                             .clip(CircleShape)
-                            .background(CosmicGoldPrimary.copy(alpha = 0.25f))
+                            .background(CyanCore.copy(alpha = 0.25f))
                     )
                 }
 
@@ -534,10 +545,10 @@ fun AffyMainScreen(
                         .background(
                             brush = Brush.radialGradient(
                                 colors = when {
-                                    isListeningNow -> listOf(CosmicGoldPrimary, Color(0xFF00838F))
-                                    uiState.state == AffyState.THINKING -> listOf(NeonViolet, Color(0xFF4A148C))
-                                    uiState.state == AffyState.SPEAKING -> listOf(CosmicGoldPrimary, CosmicGoldDeep)
-                                    else -> listOf(Color(0xFF2B2110), Color(0xFF121624))
+                                    isListeningNow -> listOf(Color(0xFF00E5FF), Color(0xFF00838F))
+                                    uiState.state == AffyState.THINKING -> listOf(AmberThinking, Color(0xFFE65100))
+                                    uiState.state == AffyState.SPEAKING -> listOf(NeonViolet, Color(0xFF4A148C))
+                                    else -> listOf(Color(0xFF1E293B), Color(0xFF0F172A))
                                 }
                             )
                         )
@@ -545,9 +556,9 @@ fun AffyMainScreen(
                             width = 2.dp,
                             color = when {
                                 isListeningNow -> CyanAccent
-                                uiState.state == AffyState.THINKING -> NeonViolet
-                                uiState.state == AffyState.SPEAKING -> CosmicGoldLight
-                                else -> CosmicGoldPrimary.copy(alpha = 0.65f)
+                                uiState.state == AffyState.THINKING -> AmberThinking
+                                uiState.state == AffyState.SPEAKING -> NeonViolet
+                                else -> Color(0xFF334155)
                             },
                             shape = CircleShape
                         )
@@ -558,7 +569,7 @@ fun AffyMainScreen(
                     Icon(
                         imageVector = if (isActiveSession) Icons.Default.Stop else Icons.Default.Mic,
                         contentDescription = if (isActiveSession) "Stop Session" else "Start Speaking",
-                        tint = if (uiState.state == AffyState.SPEAKING) Color(0xFF140D00) else Color.White,
+                        tint = Color.White,
                         modifier = Modifier.size(30.dp)
                     )
                 }

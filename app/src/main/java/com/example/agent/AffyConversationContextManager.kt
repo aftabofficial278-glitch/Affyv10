@@ -24,27 +24,9 @@ enum class SpeechAttentionCategory {
 enum class NotificationReadState {
     NEW,
     ANNOUNCED_BUT_NOT_READ,
-    DISMISSED,
-    READ_BY_USER
+    READ_BY_USER,
+    DISMISSED
 }
-
-enum class WorkflowStage {
-    INITIATED,
-    PROMPT_SUBMITTED,
-    GENERATING_IMAGE,
-    IMAGE_READY,
-    IMAGE_DOWNLOADED,
-    WALLPAPER_APPLIED,
-    COMPLETED,
-    FAILED
-}
-
-data class TaskWorkflow(
-    val id: String = java.util.UUID.randomUUID().toString(),
-    var stage: WorkflowStage = WorkflowStage.INITIATED,
-    var lastObservedStatus: String? = null,
-    val timestamp: Long = System.currentTimeMillis()
-)
 
 data class PendingNotificationContext(
     val id: String = java.util.UUID.randomUUID().toString(),
@@ -684,17 +666,8 @@ class AffyConversationContextManager private constructor() {
         reset()
     }
 
-    private var activeTaskWorkflow: TaskWorkflow? = null
-
-    fun getActiveTaskWorkflow(): TaskWorkflow? = activeTaskWorkflow
-
-    fun setActiveTaskWorkflow(workflow: TaskWorkflow?) {
-        activeTaskWorkflow = workflow
-    }
-
     fun reset() {
         _context.value = ConversationalContext()
-        activeTaskWorkflow = null
         AffyEmotionEngine.getInstance().reset()
     }
 }
