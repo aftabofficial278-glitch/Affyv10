@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -102,9 +103,18 @@ class GeminiLiveSession(
     @Volatile
     private var isTurnGenerationComplete = false
     private var playbackJob: Job? = null
+    @Volatile
+    private var totalWrittenFrames = 0L
+    @Volatile
+    private var headOffsetFrames = 0L
+
+    // Sequential Incoming Message Channel
+    private val incomingMessageChannel = Channel<Pair<String, Long>>(Channel.UNLIMITED)
+    private var messageProcessingJob: Job? = null
 
     init {
         initAudioTrack()
+        startMessageProcessingLoop()
     }
 
     private fun setInternalState(newState: LiveSessionState) {
@@ -178,6 +188,17 @@ class GeminiLiveSession(
         }
     }
 
+    private fun startMessageProcessingLoop() {
+        messageProcessingJob?.cancel()
+        messageProcessingJob = scope.launch(Dispatchers.Default) {
+            for ((text, msgSessionId) in incomingMessageChannel) {
+                if (msgSessionId == activeSessionId) {
+                    handleIncomingMessage(text, msgSessionId)
+                }
+            }
+        }
+    }
+
     private fun startPlaybackLoop() {
         playbackJob?.cancel()
         playbackJob = scope.launch(Dispatchers.IO) {
@@ -189,7 +210,10 @@ class GeminiLiveSession(
                         setInternalState(LiveSessionState.STREAMING_AUDIO)
                     }
                     try {
-                        audioTrack?.write(chunk, 0, chunk.size)
+                        val written = audioTrack?.write(chunk, 0, chunk.size) ?: 0
+                        if (written > 0) {
+                            totalWrittenFrames += (written / 2)
+                        }
 
                         // Calculate RMS amplitude for real-time visualizer
                         val byteBuf = ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN)
@@ -210,14 +234,23 @@ class GeminiLiveSession(
                         Log.w(TAG, "Audio write error: ${e.message}")
                     }
                 } else {
-                    if (isAudioPlaying && audioQueue.isEmpty()) {
+                    val track = audioTrack
+                    val isHardwareStillRendering = if (track != null && track.playState == AudioTrack.PLAYSTATE_PLAYING && totalWrittenFrames > 0L) {
+                        val head = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+                        val played = head - headOffsetFrames
+                        played < totalWrittenFrames
+                    } else false
+
+                    if (isAudioPlaying && audioQueue.isEmpty() && !isHardwareStillRendering) {
                         isAudioPlaying = false
+                        totalWrittenFrames = 0L
+                        headOffsetFrames = if (track != null) track.playbackHeadPosition.toLong() and 0xFFFFFFFFL else 0L
                         scope.launch(Dispatchers.Main) {
                             onAmplitudeChanged(0.05f)
                         }
                     }
 
-                    if (isTurnGenerationComplete && audioQueue.isEmpty() && !isAudioPlaying) {
+                    if (isTurnGenerationComplete && audioQueue.isEmpty() && !isAudioPlaying && !isHardwareStillRendering) {
                         isTurnGenerationComplete = false
                         Log.d(TAG, "Gemini Live turn completed and audio playback finished. Triggering onTurnComplete.")
                         setInternalState(LiveSessionState.CONNECTED)
@@ -225,7 +258,7 @@ class GeminiLiveSession(
                             onTurnComplete()
                         }
                     }
-                    delay(2)
+                    delay(5)
                 }
             }
         }
@@ -353,9 +386,7 @@ class GeminiLiveSession(
                 val threadName = Thread.currentThread().name
                 val elapsedMs = if (setupSentTimestamp > 0L) System.currentTimeMillis() - setupSentTimestamp else -1L
                 Log.d(TAG, "[LIVE_WS_MESSAGE_RECEIVED] sessionId=$currentId thread=$threadName elapsedMs=$elapsedMs")
-                scope.launch(Dispatchers.Default) {
-                    handleIncomingMessage(text, currentId)
-                }
+                incomingMessageChannel.trySend(Pair(text, currentId))
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -367,9 +398,7 @@ class GeminiLiveSession(
                 val elapsedMs = if (setupSentTimestamp > 0L) System.currentTimeMillis() - setupSentTimestamp else -1L
                 Log.d(TAG, "[LIVE_WS_MESSAGE_RECEIVED] sessionId=$currentId thread=$threadName elapsedMs=$elapsedMs")
                 val text = bytes.utf8()
-                scope.launch(Dispatchers.Default) {
-                    handleIncomingMessage(text, currentId)
-                }
+                incomingMessageChannel.trySend(Pair(text, currentId))
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -1326,9 +1355,12 @@ class GeminiLiveSession(
         audioQueue.clear()
         isAudioPlaying = false
         isTurnGenerationComplete = false
+        totalWrittenFrames = 0L
         try {
             audioTrack?.pause()
             audioTrack?.flush()
+            val track = audioTrack
+            headOffsetFrames = if (track != null) track.playbackHeadPosition.toLong() and 0xFFFFFFFFL else 0L
             audioTrack?.play()
         } catch (e: Exception) {
             Log.w(TAG, "AudioTrack flush error: ${e.message}")
@@ -1344,7 +1376,18 @@ class GeminiLiveSession(
 
     fun isConnecting(): Boolean = isConnecting
 
-    fun isAudioStreaming(): Boolean = isAudioPlaying || audioQueue.isNotEmpty()
+    fun isAudioStreaming(): Boolean = isAudioPlaying || audioQueue.isNotEmpty() || isAudioPlayingOut()
+
+    fun isAudioPlayingOut(): Boolean {
+        if (isAudioPlaying || audioQueue.isNotEmpty()) return true
+        val track = audioTrack ?: return false
+        if (track.playState == AudioTrack.PLAYSTATE_PLAYING && totalWrittenFrames > 0L) {
+            val head = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+            val played = head - headOffsetFrames
+            return played < totalWrittenFrames
+        }
+        return false
+    }
 
     fun disconnect() {
         disconnectInternal(isInternalReconnect = false)
@@ -1381,6 +1424,7 @@ class GeminiLiveSession(
     fun release() {
         disconnect()
         playbackJob?.cancel()
+        messageProcessingJob?.cancel()
         try {
             audioTrack?.stop()
             audioTrack?.release()

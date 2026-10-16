@@ -34,8 +34,11 @@ class AudioStreamer(
         private const val CHUNK_SIZE_SAMPLES = 512 // 32ms chunk @ 16kHz
         private const val CHUNK_SIZE_BYTES = CHUNK_SIZE_SAMPLES * 2 // 16-bit PCM = 2 bytes per sample
         private const val VOICE_THRESHOLD_RMS = 2600.0 // Calibrated threshold for genuine direct user speech (filters out fan, TV, room noise)
+        private const val BARGE_IN_PLAYBACK_THRESHOLD_RMS = 5200.0 // Elevated threshold during speaker playback to differentiate genuine user speech from self-echo
         private const val SUSTAINED_VOICE_FRAMES_REQUIRED = 6 // ~192ms of consecutive speech frames required to trigger barge-in
     }
+
+    var isPlaybackActive: (() -> Boolean)? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var recordingJob: Job? = null
@@ -154,26 +157,38 @@ class AudioStreamer(
                                 onAmplitudeChanged(normalizedAmp)
                             }
 
-                            // Robust Barge-In: Require sustained direct human speech above noise threshold (~192ms)
-                            // Prevents TV, fan, nearby chatter, or transient clicks from interrupting AFFY
+                            // Dynamic Barge-In:
+                            // When speaker playback is active, self-echo reaches ~2500-4000 RMS.
+                            // We use an elevated threshold (5200.0) and require sustained frames (~224ms)
+                            // so genuine user speech interrupts AFFY, while speaker self-echo does not.
+                            val isPlaying = isPlaybackActive?.invoke() == true
+                            val effectiveThreshold = if (isPlaying) BARGE_IN_PLAYBACK_THRESHOLD_RMS else VOICE_THRESHOLD_RMS
+                            val requiredFrames = if (isPlaying) 7 else SUSTAINED_VOICE_FRAMES_REQUIRED
+
                             val now = System.currentTimeMillis()
-                            if (rms >= VOICE_THRESHOLD_RMS) {
+                            var bargeInTriggered = false
+                            if (rms >= effectiveThreshold) {
                                 consecutiveVoiceFrames++
-                                if (consecutiveVoiceFrames >= SUSTAINED_VOICE_FRAMES_REQUIRED &&
+                                if (consecutiveVoiceFrames >= requiredFrames &&
                                     (now - lastVoiceTriggerTime > 1200L) &&
                                     (now - streamStartTime > 400L)
                                 ) {
                                     lastVoiceTriggerTime = now
                                     consecutiveVoiceFrames = 0
+                                    bargeInTriggered = true
                                     onVoiceDetected()
                                 }
                             } else {
                                 consecutiveVoiceFrames = 0
                             }
-                        }
 
-                        // Stream raw PCM16 chunk to Gemini Live WebSocket
-                        onAudioChunk(chunk)
+                            // Stream raw PCM16 chunk to Gemini Live WebSocket:
+                            // If speaker is active and no genuine barge-in was triggered, suppress self-echo audio
+                            // to prevent Gemini Live server-side VAD from hearing its own voice and creating duplicate turns.
+                            if (!isPlaying || bargeInTriggered) {
+                                onAudioChunk(chunk)
+                            }
+                        }
                     } else if (bytesRead < 0) {
                         Log.w(TAG, "AudioRecord read error code: $bytesRead")
                     }

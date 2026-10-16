@@ -24,14 +24,34 @@ enum class SpeechAttentionCategory {
 enum class NotificationReadState {
     NEW,
     ANNOUNCED_BUT_NOT_READ,
-    READ_BY_USER,
-    DISMISSED
+    DISMISSED,
+    READ_BY_USER
 }
+
+enum class WorkflowStage {
+    INITIATED,
+    PROMPT_SUBMITTED,
+    GENERATING_IMAGE,
+    IMAGE_READY,
+    IMAGE_DOWNLOADED,
+    WALLPAPER_APPLIED,
+    COMPLETED,
+    FAILED
+}
+
+data class TaskWorkflow(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    var stage: WorkflowStage = WorkflowStage.INITIATED,
+    var lastObservedStatus: String? = null,
+    val timestamp: Long = System.currentTimeMillis()
+)
 
 data class PendingNotificationContext(
     val id: String = java.util.UUID.randomUUID().toString(),
     val packageName: String,
     val sender: String,
+    val conversationTitle: String = sender,
+    val notificationKey: String = "",
     val messageText: String,
     val timestamp: Long = System.currentTimeMillis(),
     var readState: NotificationReadState = NotificationReadState.NEW
@@ -165,6 +185,8 @@ data class ConversationalContext(
     val pendingContactDisambiguation: PendingContactDisambiguation? = null,
     val pendingNotifications: List<PendingNotificationContext> = emptyList(),
     val activeNotificationSender: String? = null,
+    val activeNotificationConversationTitle: String? = null,
+    val activeNotificationKey: String? = null,
     val activeNotificationText: String? = null,
     val activeNotificationPackage: String? = null,
     val activeNotificationTimestamp: Long = 0L,
@@ -441,30 +463,75 @@ class AffyConversationContextManager private constructor() {
         }
     }
 
-    fun updateActiveNotification(sender: String, message: String, packageName: String) {
+    fun updateActiveNotification(
+        sender: String,
+        message: String,
+        packageName: String,
+        conversationTitle: String = sender,
+        notificationKey: String = ""
+    ) {
         val now = System.currentTimeMillis()
         val notif = PendingNotificationContext(
             packageName = packageName,
             sender = sender,
+            conversationTitle = conversationTitle,
+            notificationKey = notificationKey,
             messageText = message,
             timestamp = now,
             readState = NotificationReadState.NEW
         )
         _context.update { current ->
+            val targetChanged = !current.activeNotificationSender.isNullOrBlank() &&
+                    (!ContactResolver.doesIdentityMatch(current.activeNotificationSender, sender) ||
+                            !current.activeNotificationPackage.equals(packageName, ignoreCase = true))
+
             val updatedList = (listOf(notif) + current.pendingNotifications.filter {
-                it.sender != sender || (now - it.timestamp) < 300_000L // Keep recent 5 mins
+                (!ContactResolver.doesIdentityMatch(it.sender, sender) || !it.packageName.equals(packageName, ignoreCase = true)) &&
+                        (now - it.timestamp) < 300_000L // Keep recent 5 mins
             }).take(10)
 
             current.copy(
                 pendingNotifications = updatedList,
                 activeNotificationSender = sender,
+                activeNotificationConversationTitle = conversationTitle,
+                activeNotificationKey = notificationKey,
                 activeNotificationText = message,
                 activeNotificationPackage = packageName,
                 activeNotificationTimestamp = now,
+                pendingContactDisambiguation = if (targetChanged) null else current.pendingContactDisambiguation,
+                pendingClarification = if (targetChanged) null else current.pendingClarification,
                 lastUpdateTime = now
             )
         }
-        Log.d(TAG, "Active notification context updated: sender='$sender', pkg='$packageName'")
+        Log.d(TAG, "Active notification context updated: sender='$sender', conv='$conversationTitle', pkg='$packageName'")
+    }
+
+    fun clearActiveNotificationContext() {
+        _context.update {
+            it.copy(
+                activeNotificationSender = null,
+                activeNotificationConversationTitle = null,
+                activeNotificationKey = null,
+                activeNotificationText = null,
+                activeNotificationPackage = null,
+                activeNotificationTimestamp = 0L
+            )
+        }
+        Log.d(TAG, "Cleared active notification target context")
+    }
+
+    fun invalidateStaleNotificationIfTargetChanged(newTarget: String) {
+        val clean = newTarget.trim()
+        if (clean.isBlank()) return
+        val current = _context.value
+        val activeSender = current.activeNotificationSender ?: return
+        val activeConv = current.activeNotificationConversationTitle ?: activeSender
+        if (!ContactResolver.doesIdentityMatch(activeSender, clean) &&
+            !ContactResolver.doesIdentityMatch(activeConv, clean)
+        ) {
+            Log.i(TAG, "[WA_CONTEXT_INVALIDATED] Invalidating stale notification target '$activeSender' because new target is '$clean'")
+            clearActiveNotificationContext()
+        }
     }
 
     fun markNotificationAnnounced(sender: String) {
@@ -599,11 +666,12 @@ class AffyConversationContextManager private constructor() {
         val isNotifFresh = (now - current.activeNotificationTimestamp) < 120_000L
         if (isNotifFresh && !current.activeNotificationSender.isNullOrBlank()) {
             val pronounPatterns = listOf(
-                "iski", "iska", "isko", "unka", "unki", "unko", "inhe", "unhe", "inhein",
-                "unhein", "woh", "uska", "uski", "usko", "is bande", "us bande", "is shakhs",
-                "chat", "handle", "reply", "ye wala", "pehla wala", "latest"
+                "iski", "iska", "isko", "ise", "isay", "unka", "unki", "unko", "inhe", "unhe", "inhein",
+                "unhein", "woh", "uska", "uski", "usko", "use", "usay", "is bande", "us bande", "is shakhs",
+                "ye wala", "pehla wala", "latest", "recent", "last", "him", "her", "them",
+                "sender", "notification", "reply"
             )
-            if (pronounPatterns.any { lower.contains(it) }) {
+            if (lower.isBlank() || pronounPatterns.any { lower == it || lower.startsWith("$it ") || lower.endsWith(" $it") || lower.contains(" $it ") }) {
                 Log.d(TAG, "Resolved contextual pronoun in '$utterance' -> '${current.activeNotificationSender}'")
                 return current.activeNotificationSender
             }
@@ -616,8 +684,17 @@ class AffyConversationContextManager private constructor() {
         reset()
     }
 
+    private var activeTaskWorkflow: TaskWorkflow? = null
+
+    fun getActiveTaskWorkflow(): TaskWorkflow? = activeTaskWorkflow
+
+    fun setActiveTaskWorkflow(workflow: TaskWorkflow?) {
+        activeTaskWorkflow = workflow
+    }
+
     fun reset() {
         _context.value = ConversationalContext()
+        activeTaskWorkflow = null
         AffyEmotionEngine.getInstance().reset()
     }
 }

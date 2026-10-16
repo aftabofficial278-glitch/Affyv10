@@ -1,6 +1,5 @@
 <resources>
-    <string name="app_name">AFFY</string>
+    <string name="app_name">AFFY 2.5</string>
     <string name="accessibility_service_name">AFFY Assistant Service</string>
-    <string name="accessibility_service_description">Enables AFFY to interact with your screen, navigate apps, scroll, and assist with hands-free device automation.</string>
+    <string name="accessibility_service_description">AFFY intelligent assistant automation and screen interaction service</string>
 </resources>
-

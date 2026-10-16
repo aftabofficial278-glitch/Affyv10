@@ -121,6 +121,7 @@ class AffyActionExecutor(
             ActionTypes.READ_NOTIFICATION -> handleReadNotifications(action.target)
             ActionTypes.READ_VISIBLE_CHATS -> handleReadVisibleChats()
             ActionTypes.READ_SCREEN_MESSAGES -> handleReadScreenMessages()
+            ActionTypes.OPEN_CHAT -> handleOpenChat(action.target)
             ActionTypes.HANDLE_CHAT_AUTHORIZATION -> handleAuthorizeChat(action.target ?: "")
             ActionTypes.REVOKE_CHAT_AUTHORIZATION -> handleRevokeChat(action.target)
             ActionTypes.REMEMBER_FACT -> handleRememberFact(action.value ?: action.text ?: action.target ?: "")
@@ -409,10 +410,16 @@ class AffyActionExecutor(
         }
 
         val notifAssistant = AffyNotificationAssistant.getInstance(context)
-        // Priority 1: Check background RemoteInput
+        notifAssistant.invalidateStaleTargetIfChanged(recipientName)
+
+        // Priority 1: Check bound notification target ONLY if it strictly matches recipientName / recipientPhone
         val contextualMsg = notifAssistant.resolveContextualSender(recipientName)
-            ?: notifAssistant.resolveContextualSender(recipientPhone)
-        if (contextualMsg != null) {
+            ?.takeIf {
+                ContactResolver.doesIdentityMatch(it.sender, recipientName, recipientPhone) ||
+                        ContactResolver.doesIdentityMatch(it.conversationTitle, recipientName, recipientPhone)
+            }
+
+        if (contextualMsg != null && (targetPackage == null || targetPackage.equals(contextualMsg.packageName, ignoreCase = true))) {
             val (directSuccess, directSummary) = notifAssistant.executeDirectReply(contextualMsg.sender, message)
             if (directSuccess) {
                 return ActionResult(
@@ -423,7 +430,16 @@ class AffyActionExecutor(
             }
         }
 
-        // Priority 2: Foreground Accessibility Flow with strict verification
+        // Validate phone number before using a wa.me / api.whatsapp.com link (never invent numbers)
+        if (!ContactResolver.isValidPhoneNumber(recipientPhone)) {
+            return ActionResult(
+                isSuccess = false,
+                summary = "Invalid or unverified phone number for $recipientName",
+                speechResponseOverride = "Boss, $recipientName ka phone number verify nahi ho saka. Aap kis chat mein message bhejna chahte hain?"
+            )
+        }
+
+        // Priority 2: Foreground Accessibility Flow with strict conversation and message verification
         val installedInstances = WhatsAppInstanceManager.getInstalledInstances(context)
         if (installedInstances.isEmpty()) {
             return ActionResult(
@@ -433,7 +449,8 @@ class AffyActionExecutor(
             )
         }
 
-        val resolvedPkg = targetPackage
+        val resolvedPkg = targetPackage?.takeIf { it.isNotBlank() }
+            ?: contextualMsg?.packageName?.takeIf { it.isNotBlank() }
             ?: preferences.preferredWhatsAppPackageFlow.first().ifBlank { null }
             ?: WhatsAppInstanceManager.resolveOutgoingInstance(context)
             ?: WhatsAppInstanceManager.PKG_WHATSAPP
@@ -450,12 +467,29 @@ class AffyActionExecutor(
             val a11y = AffyAccessibilityService.instance
             if (a11y != null) {
                 delay(800)
-                val isSent = a11y.automateWhatsAppSend(targetPackage = resolvedPkg, messageText = message)
-                return if (isSent) {
+                val verifyResult = a11y.automateWhatsAppSendVerified(
+                    targetPackage = resolvedPkg,
+                    messageText = message,
+                    expectedRecipient = recipientName,
+                    expectedPhone = cleanPhone
+                )
+                return if (verifyResult.isSentAndVerified) {
+                    notifAssistant.markSenderMessagesReplied(recipientName, resolvedPkg)
+                    AffyConversationContextManager.getInstance().clearActiveNotificationContext()
                     ActionResult(
                         isSuccess = true,
                         summary = "WhatsApp message sent to $recipientName",
                         speechResponseOverride = "Ji boss! $recipientName ko WhatsApp message bhej diya hai."
+                    )
+                } else if (
+                    verifyResult.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.CHAT_IDENTITY_MISMATCH ||
+                    verifyResult.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.CHAT_IDENTITY_UNCONFIRMED ||
+                    verifyResult.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.PACKAGE_MISMATCH
+                ) {
+                    ActionResult(
+                        isSuccess = false,
+                        summary = "WhatsApp chat identity unconfirmed for $recipientName",
+                        speechResponseOverride = "Boss, $recipientName ki exact chat confirm nahi ho saki. Aap kis chat mein message bhejna chahte hain?"
                     )
                 } else {
                     ActionResult(
@@ -598,45 +632,133 @@ class AffyActionExecutor(
     }
 
     private suspend fun handleWhatsAppMessage(recipient: String, message: String): ActionResult {
-        var resolvedTarget = recipient.trim()
-        val lowerTarget = resolvedTarget.lowercase()
+        val rawRecipient = recipient.trim()
+        val lowerTarget = rawRecipient.lowercase()
 
-        // Resolve contextual pronouns ("iski", "iska", "isko", "chat", "handle", "unka", "inhe")
         val notifAssistant = AffyNotificationAssistant.getInstance(context)
-        if (lowerTarget.contains("iski") || lowerTarget.contains("iska") || lowerTarget.contains("isko") ||
-            lowerTarget.contains("uska") || lowerTarget.contains("unka") || lowerTarget.contains("inhe") ||
-            lowerTarget.contains("unhe") || lowerTarget.contains("chat") || resolvedTarget.isBlank()) {
-            val contextual = notifAssistant.resolveContextualSender(resolvedTarget)?.sender
-                ?: AffyConversationContextManager.getInstance().resolveContextualRecipient(resolvedTarget)
-            if (!contextual.isNullOrBlank()) {
-                Log.d("AffyActionExecutor", "Resolved contextual WhatsApp target '$recipient' -> '$contextual'")
-                resolvedTarget = contextual
+        val contextManager = AffyConversationContextManager.getInstance()
+
+        val isCurrentChatKeyword = lowerTarget == "current_chat" ||
+            lowerTarget == "this_chat" ||
+            lowerTarget == "ye chat" ||
+            lowerTarget == "is chat" ||
+            lowerTarget == "jo chat open hai" ||
+            lowerTarget == "isme" ||
+            lowerTarget == "yahan"
+
+        val isContextualPronoun = isCurrentChatKeyword ||
+            rawRecipient.isBlank() ||
+            lowerTarget.contains("iski") ||
+            lowerTarget.contains("iska") ||
+            lowerTarget.contains("isko") ||
+            lowerTarget.contains("use") ||
+            lowerTarget.contains("usko") ||
+            lowerTarget.contains("uska") ||
+            lowerTarget.contains("unka") ||
+            lowerTarget.contains("inhe") ||
+            lowerTarget.contains("unhe") ||
+            lowerTarget.contains("unhein") ||
+            lowerTarget == "him" ||
+            lowerTarget == "her" ||
+            lowerTarget == "them" ||
+            lowerTarget == "sender" ||
+            lowerTarget == "notification" ||
+            lowerTarget == "reply"
+
+        var resolvedTarget = rawRecipient
+        if (isContextualPronoun) {
+            val contextualMsg = notifAssistant.resolveContextualSender(rawRecipient)
+            val contextualFromMgr = contextManager.resolveContextualRecipient(rawRecipient)
+            val resolvedContextual = contextualMsg?.sender ?: contextualFromMgr
+            if (!resolvedContextual.isNullOrBlank()) {
+                Log.d("AffyActionExecutor", "Resolved contextual WhatsApp target '$recipient' -> '$resolvedContextual'")
+                resolvedTarget = resolvedContextual
+            } else if (notifAssistant.hasAmbiguousRecentSenders()) {
+                return ActionResult(
+                    isSuccess = false,
+                    summary = "Ambiguous notification reply target; refused to assume open chat",
+                    speechResponseOverride = notifAssistant.getAmbiguousSenderClarificationPrompt()
+                )
+            } else if (isCurrentChatKeyword) {
+                // Only if there is no ambiguous unread notification context, inspect the live open WhatsApp header
+                val unreadSenders = notifAssistant.getRecentMessages()
+                    .filter { !it.replied && WhatsAppInstanceManager.isWhatsAppPackage(it.packageName) }
+                    .map { it.sender.lowercase().trim() }
+                    .distinct()
+                if (unreadSenders.isNotEmpty()) {
+                    return ActionResult(
+                        isSuccess = false,
+                        summary = "Ambiguous notification reply target; refused to assume open chat",
+                        speechResponseOverride = "Boss, abhi multiple ya unconfirmed notifications hain. Aap kis ki chat mein reply bhejna chahte hain? Naam bata dein."
+                    )
+                }
+                val a11y = AffyAccessibilityService.instance
+                val root = a11y?.getFreshActiveWindowRoot()
+                val activeTitle = if (root != null) a11y.extractActiveWhatsAppChatTitle(root) else null
+                if (!activeTitle.isNullOrBlank()) {
+                    resolvedTarget = activeTitle
+                } else {
+                    return ActionResult(
+                        isSuccess = false,
+                        summary = "Could not confirm active WhatsApp chat header",
+                        speechResponseOverride = "Boss, saamne konsi WhatsApp chat khuli hai ye confirm nahi ho saka. Aap kis ko message bhejna chahte hain?"
+                    )
+                }
+            } else {
+                resolvedTarget = ""
             }
+        } else {
+            // Explicit recipient specified: invalidate stale notification context if target changed
+            contextManager.invalidateStaleNotificationIfTargetChanged(resolvedTarget)
+            notifAssistant.invalidateStaleTargetIfChanged(resolvedTarget)
         }
 
         if (resolvedTarget.isBlank()) {
-            return ActionResult(false, "No recipient specified", "Kisko WhatsApp message bhejna hai?")
+            return ActionResult(
+                isSuccess = false,
+                summary = "No verified recipient specified",
+                speechResponseOverride = "Boss, kis chat mein WhatsApp message bhejna hai? Naam bata dein."
+            )
         }
         if (message.isBlank()) {
             return ActionResult(false, "No message content", "Message kya bhejna hai?")
         }
 
-        // Check if there is an active/recent notification from this sender to reply in background via RemoteInput
         val contextualMsg = notifAssistant.resolveContextualSender(resolvedTarget)
+        val activePendingNotif = contextManager.getPendingNotifications(resolvedTarget).firstOrNull {
+            ContactResolver.doesIdentityMatch(it.sender, resolvedTarget) ||
+                ContactResolver.doesIdentityMatch(it.conversationTitle, resolvedTarget)
+        }
+
+        val boundNotifPkg = (contextualMsg?.packageName ?: activePendingNotif?.packageName)
+            ?.takeIf { WhatsAppInstanceManager.isWhatsAppPackage(it) }
+
+        // Check if there is an active/recent notification bound to this exact sender
         if (contextualMsg != null) {
-            Log.d("AffyActionExecutor", "Found recent notification for '$resolvedTarget' (${contextualMsg.sender}). Attempting background RemoteInput reply.")
+            val matchedSender = contextualMsg.sender
+            Log.d("AffyActionExecutor", "Found bound notification for '$resolvedTarget' ($matchedSender, pkg=$boundNotifPkg). Attempting verified reply.")
             val (directSuccess, directSummary) = notifAssistant.executeDirectReply(resolvedTarget, message)
             if (directSuccess) {
                 return ActionResult(
                     isSuccess = true,
                     summary = directSummary,
-                    speechResponseOverride = "Boss, ${contextualMsg.sender} ko reply bhej diya."
+                    speechResponseOverride = "Boss, $matchedSender ko reply bhej diya hai."
                 )
             }
-            Log.d("AffyActionExecutor", "RemoteInput unavailable/failed; falling back to accessibility path.")
+            if (directSummary.contains("confirm nahi ho saki", ignoreCase = true) ||
+                directSummary.contains("kis chat mein", ignoreCase = true) ||
+                directSummary.contains("konsi chat", ignoreCase = true)
+            ) {
+                return ActionResult(
+                    isSuccess = false,
+                    summary = directSummary,
+                    speechResponseOverride = directSummary
+                )
+            }
+            Log.d("AffyActionExecutor", "Direct notification reply unavailable; falling back to verified Accessibility UI / validated wa.me path.")
         }
 
-        // 1. Detect installed WhatsApp instances dynamically (supports all 5+ accounts)
+        // 1. Detect installed WhatsApp instances dynamically
         val installedInstances = WhatsAppInstanceManager.getInstalledInstances(context)
         if (installedInstances.isEmpty()) {
             return ActionResult(
@@ -651,72 +773,79 @@ class AffyActionExecutor(
         val requestedClone = message.contains("clone", ignoreCase = true) || resolvedTarget.contains("clone", ignoreCase = true) || message.contains("dual", ignoreCase = true) || resolvedTarget.contains("dual", ignoreCase = true)
         val foregroundPkg = AffyAccessibilityService.currentAppPackage.value ?: ""
 
-        // Screen-First check: If target explicitly points to the currently open chat on screen
-        val isCurrentChatRef = resolvedTarget.equals("current_chat", ignoreCase = true) ||
-                resolvedTarget.equals("this_chat", ignoreCase = true) ||
-                resolvedTarget.equals("ye chat", ignoreCase = true) ||
-                resolvedTarget.equals("is chat", ignoreCase = true) ||
-                resolvedTarget.equals("jo chat open hai", ignoreCase = true) ||
-                resolvedTarget.equals("isme", ignoreCase = true) ||
-                resolvedTarget.equals("yahan", ignoreCase = true) ||
-                (WhatsAppInstanceManager.isWhatsAppPackage(foregroundPkg) && resolvedTarget.isBlank())
-
-        val targetPackage: String
-        if (!foregroundPkg.isBlank() && WhatsAppInstanceManager.isWhatsAppPackage(foregroundPkg)) {
-            // If WhatsApp is already active in foreground, reuse it without prompting
-            targetPackage = foregroundPkg
-        } else if (installedInstances.size > 1 && preferredPkg.isBlank() && !requestedBusiness && !requestedClone) {
-            return ActionResult(
-                isSuccess = false,
-                summary = "Multiple WhatsApp instances found",
-                speechResponseOverride = "Boss, kis WhatsApp se bhejun?"
-            )
-        } else {
-            targetPackage = WhatsAppInstanceManager.resolveOutgoingInstance(
-                context = context,
-                preferBusiness = requestedBusiness,
-                preferredPackage = preferredPkg.ifBlank { null }
-            ) ?: WhatsAppInstanceManager.PKG_WHATSAPP
-            
-            // Remember preference if explicitly chosen
-            if (requestedBusiness || requestedClone) {
+        // Bind to originating notification's WhatsApp package first; never blindly override with foregroundPkg
+        val targetPackage: String = when {
+            !boundNotifPkg.isNullOrBlank() -> boundNotifPkg
+            requestedBusiness || requestedClone -> {
+                val resolved = WhatsAppInstanceManager.resolveOutgoingInstance(
+                    context = context,
+                    preferBusiness = requestedBusiness,
+                    preferredPackage = preferredPkg.ifBlank { null }
+                ) ?: WhatsAppInstanceManager.PKG_WHATSAPP
                 try {
-                    preferences.savePreferredWhatsAppPackage(targetPackage)
+                    preferences.savePreferredWhatsAppPackage(resolved)
                 } catch (_: Exception) {}
+                resolved
             }
-        }
-
-        // 2. If screen-first current chat was requested, execute and verify directly without searching Contacts
-        if (isCurrentChatRef) {
-            val a11y = AffyAccessibilityService.instance
-            if (a11y != null) {
-                val isSent = a11y.automateWhatsAppSend(targetPackage = targetPackage, messageText = message)
-                return if (isSent) {
-                    ActionResult(
-                        isSuccess = true,
-                        summary = "WhatsApp message sent to current chat",
-                        speechResponseOverride = "Ji boss! Message bhej diya hai."
-                    )
-                } else {
-                    ActionResult(
-                        isSuccess = false,
-                        summary = "WhatsApp send unverified",
-                        speechResponseOverride = "Message type kiya hai magar send verify nahi hua."
-                    )
-                }
-            } else {
+            preferredPkg.isNotBlank() && installedInstances.any { it.packageName == preferredPkg } -> preferredPkg
+            foregroundPkg.isNotBlank() && WhatsAppInstanceManager.isWhatsAppPackage(foregroundPkg) && installedInstances.size == 1 -> foregroundPkg
+            installedInstances.size > 1 -> {
                 return ActionResult(
                     isSuccess = false,
-                    summary = "Accessibility inactive",
-                    speechResponseOverride = "Chat mein send karne ke liye Accessibility permission chahiye."
+                    summary = "Multiple WhatsApp instances found",
+                    speechResponseOverride = "Boss, kis WhatsApp se bhejun?"
                 )
+            }
+            else -> WhatsAppInstanceManager.resolveOutgoingInstance(
+                context = context,
+                preferBusiness = false,
+                preferredPackage = null
+            ) ?: WhatsAppInstanceManager.PKG_WHATSAPP
+        }
+
+        // 2. Before using wa.me, verify or open the exact conversation in fresh Accessibility UI if available
+        val a11y = AffyAccessibilityService.instance
+        if (a11y != null) {
+            val expectedChatIdentity = contextualMsg?.conversationTitle?.ifBlank { contextualMsg.sender }
+                ?: activePendingNotif?.conversationTitle?.ifBlank { activePendingNotif.sender }
+                ?: resolvedTarget
+            val chatReady = a11y.openOrVerifyWhatsAppChat(
+                targetPackage = targetPackage,
+                expectedRecipient = expectedChatIdentity
+            )
+            if (chatReady) {
+                val sendVerification = a11y.automateWhatsAppSendVerified(
+                    targetPackage = targetPackage,
+                    messageText = message,
+                    expectedRecipient = expectedChatIdentity
+                )
+                if (sendVerification.isSentAndVerified) {
+                    val confirmedHeader = sendVerification.verifiedChatTitle ?: resolvedTarget
+                    notifAssistant.markSenderMessagesReplied(resolvedTarget, targetPackage)
+                    contextManager.clearActiveNotificationContext()
+                    return ActionResult(
+                        isSuccess = true,
+                        summary = "WhatsApp message sent & verified in chat '$confirmedHeader'",
+                        speechResponseOverride = "Ji boss! $confirmedHeader ko WhatsApp message bhej diya hai aur chat mein verify kar liya hai."
+                    )
+                } else if (
+                    sendVerification.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.CHAT_IDENTITY_MISMATCH ||
+                    sendVerification.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.PACKAGE_MISMATCH
+                ) {
+                    val observed = sendVerification.verifiedChatTitle ?: "dusri chat"
+                    return ActionResult(
+                        isSuccess = false,
+                        summary = "Aborted send: open chat '$observed' did not match '$resolvedTarget'",
+                        speechResponseOverride = "Boss, saamne '$observed' ki chat khuli thi jabke message '$resolvedTarget' ke liye tha, isliye maine send nahi kiya. Aap bata dein kis chat mein bhejna hai?"
+                    )
+                }
             }
         }
 
-        // 3. Disambiguate recipient contact (strictly: ask if multiple, never guess)
+        // 3. Disambiguate recipient contact and validate phone number before using wa.me link
         val contactResult = contactResolver.resolveContact(resolvedTarget)
-        var targetPhoneNumber: String? = null
-        var resolvedDisplayName: String = resolvedTarget
+        val targetPhoneNumber: String
+        val resolvedDisplayName: String
 
         when (contactResult) {
             is ContactResolutionResult.Multiple -> {
@@ -726,7 +855,7 @@ class AffyActionExecutor(
 
                 val speechPrompt = "${contactResult.candidates[0].name} ke ${contactResult.candidates.size} contacts mile hain:\n$formattedList\nKaunse number pe WhatsApp message bhejun?"
 
-                AffyConversationContextManager.getInstance().setPendingContactDisambiguation(
+                contextManager.setPendingContactDisambiguation(
                     PendingContactDisambiguation(
                         actionType = DisambiguationActionType.WHATSAPP,
                         originalQuery = resolvedTarget,
@@ -744,76 +873,46 @@ class AffyActionExecutor(
             }
             is ContactResolutionResult.Single -> {
                 resolvedDisplayName = contactResult.name
-                targetPhoneNumber = contactResult.phoneNumber.replace(Regex("[^0-9+]"), "")
+                val candidatePhone = contactResult.phoneNumber.replace(Regex("[^0-9+]"), "")
+                if (!ContactResolver.isValidPhoneNumber(candidatePhone)) {
+                    return ActionResult(
+                        isSuccess = false,
+                        summary = "Invalid phone number for $resolvedDisplayName; refused wa.me link",
+                        speechResponseOverride = "Boss, $resolvedDisplayName ka valid phone number confirm nahi ho saka aur exact chat bhi nahi mili. Aap bata dein kis chat mein bhejna hai?"
+                    )
+                }
+                targetPhoneNumber = candidatePhone
             }
             is ContactResolutionResult.NotFound -> {
-                // If the user spoke a raw phone number directly, allow it
-                val cleanDigits = recipient.replace(Regex("[^0-9+]"), "")
-                if (cleanDigits.length >= 7) {
+                // Only allow raw spoken phone numbers if they pass strict phone validation; never invent numbers
+                val cleanDigits = rawRecipient.replace(Regex("[^0-9+]"), "")
+                if (ContactResolver.isValidPhoneNumber(cleanDigits)) {
+                    resolvedDisplayName = cleanDigits
                     targetPhoneNumber = cleanDigits
                 } else {
                     return ActionResult(
                         isSuccess = false,
-                        summary = "Contact not found",
-                        speechResponseOverride = "Hmm, $recipient naam ka contact nahi mila. Kripya pura naam ya phone number batayein."
+                        summary = "Could not verify chat or contact for '$resolvedTarget'",
+                        speechResponseOverride = "Boss, '$resolvedTarget' ki exact WhatsApp chat ya saved contact confirm nahi ho saka. Main bina confirm kiye message send nahi karunga. Aap bata dein kis chat mein bhejna hai?"
                     )
                 }
             }
             is ContactResolutionResult.PermissionMissing -> {
                 return ActionResult(
                     isSuccess = false,
-                    summary = "Contacts permission missing",
-                    speechResponseOverride = "Contact dhoondne ke liye Contacts permission allow karni hogi."
+                    summary = "Contacts permission missing and chat not verified on screen",
+                    speechResponseOverride = "Boss, '$resolvedTarget' ki chat screen par confirm nahi ho saki aur contact dhoondne ke liye Contacts permission chahiye. Aap bata dein kis chat mein bhejna hai?"
                 )
             }
         }
 
-        // 3. Open WhatsApp chat with staged message in the target instance
-        try {
-            val cleanPhone = if (targetPhoneNumber.startsWith("+")) targetPhoneNumber.substring(1) else targetPhoneNumber
-            val uri = Uri.parse("https://api.whatsapp.com/send?phone=$cleanPhone&text=${Uri.encode(message)}")
-            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
-                `package` = targetPackage
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
-            context.startActivity(intent)
-
-            // 4. Automated Send & Verification via Accessibility Service
-            val a11y = AffyAccessibilityService.instance
-            if (a11y != null) {
-                // Allow brief transition time for chat activity to launch in WhatsApp
-                delay(800)
-                val isSent = a11y.automateWhatsAppSend(targetPackage = targetPackage, messageText = message)
-                if (isSent) {
-                    return ActionResult(
-                        isSuccess = true,
-                        summary = "WhatsApp message sent to $resolvedDisplayName",
-                        speechResponseOverride = "Ji boss! $resolvedDisplayName ko WhatsApp message bhej diya hai."
-                    )
-                } else {
-                    // Send was not confirmed
-                    return ActionResult(
-                        isSuccess = false,
-                        summary = "WhatsApp send unverified",
-                        speechResponseOverride = "$resolvedDisplayName ki chat khol di hai magar auto-send verify nahi ho saka. Send dabayein."
-                    )
-                }
-            }
-
-            // Staged in chat but accessibility service is not active to automate click
-            return ActionResult(
-                isSuccess = true,
-                summary = "Opened WhatsApp chat for $resolvedDisplayName",
-                speechResponseOverride = "$resolvedDisplayName ki chat khol di hai boss. Direct send ke liye Accessibility enable karein."
-            )
-        } catch (e: Exception) {
-            Log.e("AffyActionExecutor", "WhatsApp execution error: ${e.message}")
-            return ActionResult(
-                isSuccess = false,
-                summary = "WhatsApp send failed: ${e.message}",
-                speechResponseOverride = "WhatsApp open karne mein masla hua."
-            )
-        }
+        // 4. Open WhatsApp via validated wa.me link and verify recipient header & message appearance before reporting success
+        return executeDirectWhatsApp(
+            recipientPhone = targetPhoneNumber,
+            recipientName = resolvedDisplayName,
+            message = message,
+            targetPackage = targetPackage
+        )
     }
 
     private fun handleSendSms(recipient: String, message: String): ActionResult {
@@ -1074,6 +1173,39 @@ class AffyActionExecutor(
             ActionResult(true, "Read visible messages", speechResponseOverride = messages)
         } else {
             ActionResult(false, "No messages visible", speechResponseOverride = "Screen par koi readable message visible nahi hai.")
+        }
+    }
+
+    private suspend fun handleOpenChat(contactName: String?): ActionResult {
+        if (contactName.isNullOrBlank()) {
+            return ActionResult(false, "No contact specified", "Kiski chat open karni hai?")
+        }
+        val cleanName = ContactResolver.cleanContactQuery(contactName).ifBlank { contactName.trim() }
+        val service = AffyAccessibilityService.instance
+        if (service == null) {
+            return ActionResult(false, "Accessibility inactive", "Screen access karne ke liye Accessibility enable karni hogi.")
+        }
+        val opened = service.openChatByContactName(cleanName)
+        if (opened) {
+            visionEngine.waitForMeaningfulChange(1200)
+            return ActionResult(true, "Opened chat for $cleanName", "$cleanName ki chat open kar di hai boss.")
+        } else {
+            val res = contactResolver.resolveContact(cleanName)
+            if (res is ContactResolutionResult.Single) {
+                val cleanPhone = res.phoneNumber.replace(Regex("[^0-9]"), "")
+                val targetPkg = WhatsAppInstanceManager.resolveOutgoingInstance(context) ?: WhatsAppInstanceManager.PKG_WHATSAPP
+                try {
+                    val uri = Uri.parse("https://api.whatsapp.com/send?phone=$cleanPhone")
+                    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                        `package` = targetPkg
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                    visionEngine.waitForMeaningfulChange(1500)
+                    return ActionResult(true, "Opened chat for ${res.name}", "${res.name} ki WhatsApp chat open kar di hai.")
+                } catch (_: Exception) {}
+            }
+            return ActionResult(false, "Chat not found", "Screen par $cleanName ki chat nahi mili.")
         }
     }
 
@@ -1768,9 +1900,17 @@ class AffyActionExecutor(
 
         val foregroundPkg = AffyAccessibilityService.currentAppPackage.value ?: ""
         if (WhatsAppInstanceManager.isWhatsAppPackage(foregroundPkg) || foregroundPkg.contains("messaging") || foregroundPkg.contains("mms")) {
-            val chatMessages = service.readVisibleChatMessages()
-            if (!chatMessages.isNullOrBlank()) {
-                return ActionResult(true, "Read visible chat", chatMessages)
+            val headerTitle = service.getChatHeaderTitle()
+            if (!headerTitle.isNullOrBlank()) {
+                val chatMessages = service.readVisibleChatMessages()
+                if (!chatMessages.isNullOrBlank()) {
+                    return ActionResult(true, "Read visible chat", chatMessages)
+                }
+            } else {
+                val chatList = service.readVisibleChatList()
+                if (!chatList.isNullOrBlank() && !chatList.contains("nahi mila")) {
+                    return ActionResult(true, "Read visible chat list", chatList)
+                }
             }
         }
 

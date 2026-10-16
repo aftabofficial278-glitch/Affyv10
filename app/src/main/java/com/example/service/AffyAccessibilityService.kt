@@ -38,6 +38,14 @@ class AffyAccessibilityService : AccessibilityService() {
         var instance: AffyAccessibilityService? = null
             private set
 
+        fun getInstance(): AffyAccessibilityService? = instance
+
+        @Volatile
+        var lastNotificationTimestamp: Long = 0L
+
+        @Volatile
+        var lastNotificationText: String = ""
+
         private val _isServiceConnected = MutableStateFlow(false)
         val isServiceConnected: StateFlow<Boolean> = _isServiceConnected.asStateFlow()
 
@@ -881,7 +889,7 @@ class AffyAccessibilityService : AccessibilityService() {
             return "Screen par koi visible chat ya contact list nahi mila."
         }
 
-        return "Samne yeh chats aur contacts visible hain:\n" + chatEntries.take(8).map { "• $it" }.joinToString("\n")
+        return "Screen par is waqt ${chatEntries.size} contacts aur chats visible hain:\n" + chatEntries.take(10).mapIndexed { idx, it -> "${idx + 1}. $it" }.joinToString("\n")
     }
 
     /**
@@ -1015,7 +1023,12 @@ class AffyAccessibilityService : AccessibilityService() {
         Log.i(TAG, "[SCREEN_MESSAGE_NODES] Extracted ${visibleMessages.size} visible messages: $visibleMessages")
 
         if (visibleMessages.isEmpty() && chatTitle.isNullOrBlank()) {
-            return "Screen par koi readable message visible nahi mila."
+            val visibleChats = readVisibleChatList()
+            return if (!visibleChats.isNullOrBlank() && !visibleChats.contains("nahi mila")) {
+                "Abhi chat list screen open hai, koi specific chat open nahi hai.\n$visibleChats\nAap kisi contact ki chat open karne ko kahein (jaise 'Ali ki chat open karo')."
+            } else {
+                "Screen par koi readable message visible nahi mila."
+            }
         }
 
         val titleHeader = if (!chatTitle.isNullOrBlank()) "Chat with $chatTitle" else "Current Screen Chat"
@@ -1024,6 +1037,119 @@ class AffyAccessibilityService : AccessibilityService() {
         } else {
             "$titleHeader open hai magar is chat mein koi message text visible nahi hai."
         }
+    }
+
+    /**
+     * Extracts active conversation contact/header title if inside an open chat conversation.
+     */
+    fun getChatHeaderTitle(): String? {
+        val root = rootInActiveWindow ?: return null
+        var foundTitle: String? = null
+        fun findHeader(node: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 20 || foundTitle != null) return
+            val id = node.viewIdResourceName?.lowercase() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            val isHeaderId = id.endsWith(":id/conversation_contact_name") ||
+                    id.endsWith(":id/chat_title") ||
+                    id.endsWith(":id/action_bar_title") ||
+                    id.endsWith(":id/conversation_title")
+            if (isHeaderId && text.isNotBlank() && !text.equals("WhatsApp", ignoreCase = true)) {
+                foundTitle = text
+                return
+            }
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                findHeader(child, depth + 1)
+            }
+        }
+        findHeader(root, 0)
+        return foundTitle
+    }
+
+    /**
+     * Interacts with WhatsApp or messaging screen to locate and click/open a specific contact's chat.
+     */
+    fun openChatByContactName(contactName: String): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val cleanTarget = contactName.lowercase().trim()
+        if (cleanTarget.isBlank()) return false
+
+        // 1. If chat with contact is already open
+        val currentTitle = getChatHeaderTitle()?.lowercase()
+        if (currentTitle != null && (currentTitle.contains(cleanTarget) || cleanTarget.contains(currentTitle))) {
+            Log.i(TAG, "[OPEN_CHAT] Chat with '$contactName' is already open.")
+            return true
+        }
+
+        // 2. Search visible conversation rows / contact items on screen
+        var targetNodeToClick: AccessibilityNodeInfo? = null
+
+        fun findContactNode(node: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 20 || targetNodeToClick != null) return
+            val text = node.text?.toString()?.trim() ?: ""
+            val desc = node.contentDescription?.toString()?.trim() ?: ""
+            val id = node.viewIdResourceName?.lowercase() ?: ""
+
+            val normText = text.lowercase()
+            val normDesc = desc.lowercase()
+
+            val isMatch = normText == cleanTarget ||
+                    (cleanTarget.length >= 3 && normText.startsWith(cleanTarget)) ||
+                    (cleanTarget.length >= 3 && normText.contains(cleanTarget)) ||
+                    normDesc.contains("chat with $cleanTarget") ||
+                    normDesc.startsWith(cleanTarget)
+
+            if (isMatch && text.isNotBlank()) {
+                val ignored = listOf("search", "chats", "updates", "status", "communities", "calls", "new chat", "unread", "archived", "camera", "whatsapp")
+                if (ignored.none { normText.equals(it) }) {
+                    targetNodeToClick = node
+                    return
+                }
+            }
+
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                findContactNode(child, depth + 1)
+            }
+        }
+
+        findContactNode(root, 0)
+
+        targetNodeToClick?.let { node ->
+            val clicked = clickNodeWithFallback(node)
+            Log.i(TAG, "[OPEN_CHAT] Clicked visible contact row for '$contactName': success=$clicked")
+            if (clicked) return true
+        }
+
+        // 3. Fallback: Search via WhatsApp Search Icon
+        val searchClicked = clickElementUniversal("search") || clickElementByViewId("menuitem_search") || clickElementByText("Search")
+        if (searchClicked) {
+            android.os.SystemClock.sleep(350)
+            val inputSuccess = typeText(contactName)
+            if (inputSuccess) {
+                android.os.SystemClock.sleep(700)
+                val updatedRoot = rootInActiveWindow ?: return true
+                var searchResultNode: AccessibilityNodeInfo? = null
+                fun findSearchResult(node: AccessibilityNodeInfo, depth: Int) {
+                    if (depth > 20 || searchResultNode != null) return
+                    val t = node.text?.toString()?.trim()?.lowercase() ?: ""
+                    val d = node.contentDescription?.toString()?.trim()?.lowercase() ?: ""
+                    if ((t.contains(cleanTarget) || d.contains(cleanTarget)) && !t.contains("...") && !node.isEditable) {
+                        searchResultNode = node
+                        return
+                    }
+                    for (i in 0 until node.childCount) {
+                        val child = node.getChild(i) ?: continue
+                        findSearchResult(child, depth + 1)
+                    }
+                }
+                findSearchResult(updatedRoot, 0)
+                searchResultNode?.let { return clickNodeWithFallback(it) }
+                return true
+            }
+        }
+
+        return false
     }
 
     /**
@@ -1505,14 +1631,238 @@ class AffyAccessibilityService : AccessibilityService() {
         return false
     }
 
-    /**
-     * Finds WhatsApp chat input and Send button, performs send, and verifies execution.
-     * Supports all installed WhatsApp instances with multi-attempt polling and coordinate fallbacks.
-     */
-    fun automateWhatsAppSend(targetPackage: String? = null, messageText: String? = null): Boolean {
-        val sendLabels = listOf("send", "bhejo", "bhejein", "ارسال", "send message", "sent", "post")
+    enum class WhatsAppSendFailureReason {
+        NONE,
+        SERVICE_OR_WINDOW_UNAVAILABLE,
+        PACKAGE_MISMATCH,
+        CHAT_IDENTITY_UNCONFIRMED,
+        CHAT_IDENTITY_MISMATCH,
+        INPUT_OR_SEND_NOT_FOUND,
+        MESSAGE_APPEARANCE_UNVERIFIED
+    }
 
-        // Helper to recursively find editable input node
+    data class WhatsAppSendVerificationResult(
+        val isSentAndVerified: Boolean,
+        val verifiedChatTitle: String? = null,
+        val verifiedPackage: String? = null,
+        val failureReason: WhatsAppSendFailureReason = WhatsAppSendFailureReason.NONE,
+        val details: String = ""
+    )
+
+    /**
+     * Extracts the active WhatsApp conversation header title from a fresh Accessibility tree.
+     * Returns null if WhatsApp is on the home/tab list or if no conversation header can be verified.
+     */
+    fun extractActiveWhatsAppChatTitle(rootNode: AccessibilityNodeInfo? = getFreshActiveWindowRoot()): String? {
+        val root = rootNode ?: return null
+        var explicitHeaderTitle: String? = null
+        var fallbackHeaderTitle: String? = null
+        var hasConversationInputOrList = false
+
+        val nonConversationTitles = setOf(
+            "whatsapp", "whatsapp business", "chats", "updates", "communities", "calls",
+            "search", "online", "typing...", "type a message", "message", "archive", "archived"
+        )
+
+        fun inspect(node: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 22) return
+            val id = node.viewIdResourceName?.lowercase() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+
+            if (node.isEditable || id.contains("entry") || id.contains("conversation_row") || id.contains("message_text")) {
+                hasConversationInputOrList = true
+            }
+
+            if (text.isNotBlank() && text.length > 1) {
+                val lowerText = text.lowercase()
+                val isExplicitTitleId = id.endsWith(":id/conversation_contact_name") ||
+                        id.endsWith(":id/chat_title") ||
+                        id.endsWith(":id/conversation_title") ||
+                        id.contains("conversation_contact_name")
+
+                val isGenericToolbarTitleId = id.endsWith(":id/action_bar_title") ||
+                        id.endsWith(":id/toolbar_title") ||
+                        id.endsWith(":id/title") ||
+                        id.contains("contact_name") ||
+                        id.contains("chat_name")
+
+                if (isExplicitTitleId && lowerText !in nonConversationTitles) {
+                    if (explicitHeaderTitle == null) explicitHeaderTitle = text
+                } else if (fallbackHeaderTitle == null && lowerText !in nonConversationTitles &&
+                    !lowerText.startsWith("last seen") && !lowerText.startsWith("tap here")
+                ) {
+                    val rect = Rect()
+                    node.getBoundsInScreen(rect)
+                    val isTopHeaderArea = rect.top in 1..360
+                    if ((isGenericToolbarTitleId && isTopHeaderArea) ||
+                        (isTopHeaderArea && !id.contains("search") && !id.contains("menu") && !id.contains("tab") && !text.contains(":"))
+                    ) {
+                        fallbackHeaderTitle = text
+                    }
+                }
+            }
+
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                inspect(child, depth + 1)
+            }
+        }
+
+        inspect(root, 0)
+        return explicitHeaderTitle ?: if (hasConversationInputOrList) fallbackHeaderTitle else null
+    }
+
+    /**
+     * Checks whether the sent message text actually appeared inside the open WhatsApp conversation UI
+     * (outside the editable input field and top header).
+     */
+    fun isMessageVisibleInWhatsAppConversation(
+        rootNode: AccessibilityNodeInfo,
+        expectedMessage: String,
+        inputNode: AccessibilityNodeInfo? = null
+    ): Boolean {
+        val cleanExpected = expectedMessage.trim()
+        if (cleanExpected.isBlank()) return false
+
+        val inputRect = Rect()
+        if (inputNode != null) {
+            inputNode.getBoundsInScreen(inputRect)
+        }
+
+        var foundInMessageList = false
+        fun scanMessages(node: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 22 || foundInMessageList) return
+            if (node.isEditable) return
+
+            val id = node.viewIdResourceName?.lowercase() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            val desc = node.contentDescription?.toString()?.trim() ?: ""
+
+            if (text.contains(cleanExpected, ignoreCase = true) || desc.contains(cleanExpected, ignoreCase = true)) {
+                val isInputId = id.contains("entry") || id.contains("input") || id.contains("search_src_text")
+                if (!isInputId) {
+                    val rect = Rect()
+                    node.getBoundsInScreen(rect)
+                    val isMessageId = id.endsWith(":id/message_text") ||
+                            id.endsWith(":id/message_text_view") ||
+                            id.endsWith(":id/text_content") ||
+                            id.endsWith(":id/caption") ||
+                            id.endsWith(":id/msg_text") ||
+                            id.contains("message_text") ||
+                            id.contains("msg_text") ||
+                            id.contains("conversation_row") ||
+                            id.contains("message_row")
+
+                    val isInsideConversationArea = rect.top >= 120 &&
+                            (inputRect.isEmpty || rect.bottom <= inputRect.top + 20)
+
+                    if (isMessageId || isInsideConversationArea) {
+                        foundInMessageList = true
+                        return
+                    }
+                }
+            }
+
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                scanMessages(child, depth + 1)
+            }
+        }
+
+        scanMessages(rootNode, 0)
+        return foundInMessageList
+    }
+
+    /**
+     * Opens or verifies the exact intended WhatsApp conversation using fresh Accessibility UI evidence.
+     * Never reuses a previously active chat as an assumed target.
+     */
+    fun openOrVerifyWhatsAppChat(
+        targetPackage: String?,
+        expectedRecipient: String,
+        expectedPhone: String? = null
+    ): Boolean {
+        val cleanExpected = expectedRecipient.trim()
+        if (cleanExpected.isBlank() && expectedPhone.isNullOrBlank()) return false
+
+        val root = getFreshActiveWindowRoot() ?: return false
+        val currentPkg = root.packageName?.toString() ?: ""
+        if (!WhatsAppInstanceManager.isWhatsAppPackage(currentPkg)) return false
+        if (!targetPackage.isNullOrBlank() && !currentPkg.equals(targetPackage, ignoreCase = true)) {
+            Log.w(TAG, "[WA_PACKAGE_MISMATCH] Expected package '$targetPackage' but active is '$currentPkg'")
+            return false
+        }
+
+        // 1. Check if the currently open conversation already matches the exact target
+        val currentHeader = extractActiveWhatsAppChatTitle(root)
+        if (!currentHeader.isNullOrBlank()) {
+            if (com.example.agent.ContactResolver.doesIdentityMatch(currentHeader, cleanExpected, expectedPhone)) {
+                Log.i(TAG, "[WA_CHAT_VERIFIED_OPEN] Active chat header '$currentHeader' matches target '$cleanExpected'")
+                return true
+            }
+            // Different chat is open! Navigate back to the chat list instead of reusing the wrong chat.
+            Log.w(TAG, "[WA_STALE_CHAT_REJECTED] Active chat '$currentHeader' != expected '$cleanExpected'. Navigating back.")
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            try { Thread.sleep(400) } catch (_: InterruptedException) {}
+        }
+
+        // 2. On chat list screen, try locating the exact chat row matching expectedRecipient
+        val listRoot = getFreshActiveWindowRoot() ?: return false
+        var matchedRowNode: AccessibilityNodeInfo? = null
+
+        fun findMatchingChatRow(node: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 20 || matchedRowNode != null) return
+            val id = node.viewIdResourceName?.lowercase() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            val isRowTitle = id.endsWith(":id/conversations_row_contact_name") ||
+                    id.contains("conversations_row_contact_name") ||
+                    id.contains("contact_name") ||
+                    id.endsWith(":id/title")
+
+            if (text.isNotBlank() && isRowTitle &&
+                com.example.agent.ContactResolver.doesIdentityMatch(text, cleanExpected, expectedPhone)
+            ) {
+                matchedRowNode = node
+                return
+            }
+
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                findMatchingChatRow(child, depth + 1)
+            }
+        }
+
+        findMatchingChatRow(listRoot, 0)
+        if (matchedRowNode != null && tryClickNode(matchedRowNode!!)) {
+            try { Thread.sleep(500) } catch (_: InterruptedException) {}
+            val postClickHeader = extractActiveWhatsAppChatTitle(getFreshActiveWindowRoot())
+            if (com.example.agent.ContactResolver.doesIdentityMatch(postClickHeader, cleanExpected, expectedPhone)) {
+                Log.i(TAG, "[WA_CHAT_OPENED_AND_VERIFIED] Opened chat '$postClickHeader' from chat list")
+                return true
+            }
+        }
+
+        return false
+    }
+
+    /**
+     * Finds WhatsApp chat input and Send button, verifies the exact conversation before sending,
+     * performs send, and confirms that the message appeared in the intended conversation.
+     */
+    fun automateWhatsAppSendVerified(
+        targetPackage: String? = null,
+        messageText: String? = null,
+        expectedRecipient: String? = null,
+        expectedPhone: String? = null
+    ): WhatsAppSendVerificationResult {
+        val sendLabels = listOf("send", "bhejo", "bhejein", "ارسال", "send message", "sent", "post")
+        val requiresExplicitTargetCheck = !expectedRecipient.isNullOrBlank() || !expectedPhone.isNullOrBlank()
+        var lastDetectedHeader: String? = null
+        var lastDetectedPkg: String? = null
+        var sawPackageMismatch = false
+        var sawChatIdentityMismatch = false
+        var attemptedListOpen = false
+
         fun findEditableNode(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
             if (node.isEditable) return node
             for (i in 0 until node.childCount) {
@@ -1523,7 +1873,14 @@ class AffyAccessibilityService : AccessibilityService() {
             return null
         }
 
-        // Helper to recursively locate Send button
+        fun clearEditableNode(node: AccessibilityNodeInfo?) {
+            if (node == null || !node.isEditable) return
+            val clearArgs = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+            }
+            node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clearArgs)
+        }
+
         fun findSendNode(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
             val viewId = node.viewIdResourceName?.lowercase() ?: ""
             val desc = node.contentDescription?.toString()?.lowercase()?.trim() ?: ""
@@ -1557,15 +1914,69 @@ class AffyAccessibilityService : AccessibilityService() {
 
         // Outer polling loop (up to ~3.5 seconds across 8 attempts)
         for (attempt in 1..8) {
-            val currentRoot = rootInActiveWindow
+            var currentRoot = getFreshActiveWindowRoot()
             if (currentRoot != null) {
                 val pkg = currentRoot.packageName?.toString() ?: ""
+                lastDetectedPkg = pkg
 
                 if (WhatsAppInstanceManager.isWhatsAppPackage(pkg)) {
-                    // 1. If text is provided, ensure it is populated in the input field
+                    // Enforce originating/target WhatsApp package identity when specified
+                    if (!targetPackage.isNullOrBlank() && !pkg.equals(targetPackage, ignoreCase = true)) {
+                        sawPackageMismatch = true
+                        Log.w(TAG, "[WA_PACKAGE_MISMATCH_BLOCKED] Active pkg='$pkg' != targetPackage='$targetPackage' on attempt $attempt")
+                        try { Thread.sleep(350) } catch (_: InterruptedException) {}
+                        continue
+                    }
+
+                    // 1. Verify active conversation header BEFORE typing or sending
+                    var headerTitle = extractActiveWhatsAppChatTitle(currentRoot)
+                    lastDetectedHeader = headerTitle
+
+                    if (requiresExplicitTargetCheck) {
+                        val matchesTarget = com.example.agent.ContactResolver.doesIdentityMatch(
+                            candidateIdentity = headerTitle,
+                            expectedIdentity = expectedRecipient,
+                            expectedPhone = expectedPhone
+                        )
+                        if (!matchesTarget) {
+                            if (!attemptedListOpen && !expectedRecipient.isNullOrBlank()) {
+                                attemptedListOpen = true
+                                if (openOrVerifyWhatsAppChat(targetPackage, expectedRecipient, expectedPhone)) {
+                                    currentRoot = getFreshActiveWindowRoot() ?: currentRoot
+                                    headerTitle = extractActiveWhatsAppChatTitle(currentRoot)
+                                    lastDetectedHeader = headerTitle
+                                }
+                            }
+
+                            val matchesAfterOpen = com.example.agent.ContactResolver.doesIdentityMatch(
+                                candidateIdentity = headerTitle,
+                                expectedIdentity = expectedRecipient,
+                                expectedPhone = expectedPhone
+                            )
+                            if (!matchesAfterOpen) {
+                                if (!headerTitle.isNullOrBlank()) {
+                                    sawChatIdentityMismatch = true
+                                    Log.w(TAG, "[WA_WRONG_CHAT_BLOCKED] Active chat '$headerTitle' does not match expected '${expectedRecipient ?: expectedPhone}' (attempt $attempt)")
+                                } else {
+                                    Log.w(TAG, "[WA_CHAT_HEADER_UNCONFIRMED] Could not confirm chat header for '${expectedRecipient ?: expectedPhone}' (attempt $attempt)")
+                                }
+                                try { Thread.sleep(350) } catch (_: InterruptedException) {}
+                                continue
+                            }
+                        }
+                    } else if (headerTitle.isNullOrBlank()) {
+                        // Even for explicit current-screen send, require an actual conversation header to be open
+                        Log.w(TAG, "[WA_CHAT_HEADER_UNCONFIRMED] No active conversation header found on screen (attempt $attempt)")
+                        try { Thread.sleep(350) } catch (_: InterruptedException) {}
+                        continue
+                    }
+
+                    val confirmedTargetHeader = headerTitle ?: expectedRecipient ?: ""
+
+                    // 2. Locate editable input node and populate messageText if provided
                     val inputNode = currentRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: findEditableNode(currentRoot)
                     if (inputNode != null) {
-                        Log.i(TAG, "[WA_INPUT_FOUND] inputNode=${inputNode.viewIdResourceName} editable=${inputNode.isEditable}")
+                        Log.i(TAG, "[WA_INPUT_FOUND] chat='$confirmedTargetHeader' inputNode=${inputNode.viewIdResourceName} editable=${inputNode.isEditable}")
                     }
 
                     if (!messageText.isNullOrBlank() && inputNode != null && inputNode.isEditable) {
@@ -1575,86 +1986,111 @@ class AffyAccessibilityService : AccessibilityService() {
                                 putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, messageText)
                             }
                             val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-                            Log.i(TAG, "[WA_TEXT_TYPED] text='$messageText' success=$textSet")
-                            if (textSet) {
-                                val verifiedText = inputNode.text?.toString() ?: ""
-                                Log.i(TAG, "[WA_TEXT_VERIFIED] verifiedText='$verifiedText'")
-                            }
-                        } else {
-                            Log.i(TAG, "[WA_TEXT_VERIFIED] Text already present in input: '$currentText'")
+                            Log.i(TAG, "[WA_TEXT_TYPED] chat='$confirmedTargetHeader' text='$messageText' success=$textSet")
                         }
                     }
 
                     // Brief pause to let WhatsApp UI swap the mic icon for the Send button
                     try { Thread.sleep(250) } catch (_: InterruptedException) {}
 
-                    // 2. Re-query live tree freshly to capture dynamic Send button
-                    val freshRoot = rootInActiveWindow ?: currentRoot
-                    val sendNode = findSendNode(freshRoot)
+                    // 3. Re-query fresh Accessibility tree and RE-VERIFY recipient/chat IMMEDIATELY before clicking Send
+                    val freshRoot = getFreshActiveWindowRoot() ?: currentRoot
+                    val freshPkg = freshRoot.packageName?.toString() ?: pkg
+                    val preSendHeader = extractActiveWhatsAppChatTitle(freshRoot)
+                    lastDetectedHeader = preSendHeader
 
+                    val preSendPkgOk = targetPackage.isNullOrBlank() || freshPkg.equals(targetPackage, ignoreCase = true)
+                    val preSendHeaderOk = if (requiresExplicitTargetCheck) {
+                        com.example.agent.ContactResolver.doesIdentityMatch(preSendHeader, expectedRecipient, expectedPhone)
+                    } else {
+                        !preSendHeader.isNullOrBlank() && com.example.agent.ContactResolver.doesIdentityMatch(preSendHeader, confirmedTargetHeader)
+                    }
+
+                    if (!preSendPkgOk || !preSendHeaderOk) {
+                        val freshInput = freshRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: findEditableNode(freshRoot)
+                        clearEditableNode(freshInput)
+                        Log.e(TAG, "[WA_PRE_SEND_ABORT] Recipient verification failed right before send! expected='${expectedRecipient ?: confirmedTargetHeader}', actual='$preSendHeader', pkg='$freshPkg'")
+                        return WhatsAppSendVerificationResult(
+                            isSentAndVerified = false,
+                            verifiedChatTitle = preSendHeader,
+                            verifiedPackage = freshPkg,
+                            failureReason = if (!preSendPkgOk) {
+                                WhatsAppSendFailureReason.PACKAGE_MISMATCH
+                            } else if (preSendHeader.isNullOrBlank()) {
+                                WhatsAppSendFailureReason.CHAT_IDENTITY_UNCONFIRMED
+                            } else {
+                                WhatsAppSendFailureReason.CHAT_IDENTITY_MISMATCH
+                            },
+                            details = "Aborted before send: expected '${expectedRecipient ?: confirmedTargetHeader}' but found '${preSendHeader ?: "unconfirmed"}'"
+                        )
+                    }
+
+                    val sendNode = findSendNode(freshRoot)
                     if (sendNode != null) {
                         val sendId = sendNode.viewIdResourceName ?: "no_id"
                         val sendDesc = sendNode.contentDescription?.toString() ?: "no_desc"
                         val rect = Rect()
                         sendNode.getBoundsInScreen(rect)
-                        Log.i(TAG, "[WA_SEND_BUTTON_FOUND] id=$sendId desc='$sendDesc' bounds=$rect")
+                        Log.i(TAG, "[WA_SEND_BUTTON_FOUND] chat='$preSendHeader' id=$sendId desc='$sendDesc' bounds=$rect")
 
                         var clicked = tryClickNode(sendNode)
                         if (!clicked && rect.width() > 0 && rect.height() > 0) {
-                            // Fallback: Dispatch tap at node screen coordinates
                             clicked = performTap(rect.centerX().toFloat(), rect.centerY().toFloat())
                         }
-                        Log.i(TAG, "[WA_SEND_CLICKED] clicked=$clicked on attempt $attempt")
+                        Log.i(TAG, "[WA_SEND_CLICKED] chat='$preSendHeader' clicked=$clicked on attempt $attempt")
 
                         if (clicked) {
-                            Log.d(TAG, "Dispatched WhatsApp send in $pkg (attempt $attempt), verifying...")
-
-                            // Verification loop
+                            // 4. Confirm success ONLY after verifying that the message appeared in the intended conversation
                             for (vAttempt in 0 until 6) {
                                 try { Thread.sleep(300) } catch (_: InterruptedException) {}
 
-                                val updatedRoot = rootInActiveWindow ?: continue
+                                val updatedRoot = getFreshActiveWindowRoot() ?: continue
+                                val updatedPkg = updatedRoot.packageName?.toString() ?: ""
+                                if (!targetPackage.isNullOrBlank() && !updatedPkg.equals(targetPackage, ignoreCase = true)) {
+                                    continue
+                                }
+
+                                val postSendHeader = extractActiveWhatsAppChatTitle(updatedRoot)
+                                val sameIntendedChat = if (requiresExplicitTargetCheck) {
+                                    com.example.agent.ContactResolver.doesIdentityMatch(postSendHeader, expectedRecipient, expectedPhone)
+                                } else {
+                                    !postSendHeader.isNullOrBlank() && com.example.agent.ContactResolver.doesIdentityMatch(postSendHeader, preSendHeader)
+                                }
+                                if (!sameIntendedChat) {
+                                    Log.w(TAG, "[WA_POST_SEND_CHAT_MISMATCH] Expected '$preSendHeader' but post-send header is '$postSendHeader'")
+                                    continue
+                                }
+
                                 val updatedInput = updatedRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: findEditableNode(updatedRoot)
                                 val remainingText = updatedInput?.text?.toString() ?: ""
+                                val inputCleared = remainingText.isBlank() ||
+                                        (!messageText.isNullOrBlank() && !remainingText.contains(messageText))
 
-                                // Check 1: Input text was cleared / sent
-                                if (remainingText.isBlank() || (!messageText.isNullOrBlank() && !remainingText.contains(messageText))) {
-                                    Log.i(TAG, "[WA_SEND_VERIFIED] WhatsApp message send verified: input text cleared on $pkg")
-                                    return true
+                                val messageAppeared = if (!messageText.isNullOrBlank()) {
+                                    isMessageVisibleInWhatsAppConversation(updatedRoot, messageText, updatedInput)
+                                } else {
+                                    findSendNode(updatedRoot) == null
                                 }
 
-                                // Check 2: Send button has vanished / reverted to mic
-                                val updatedSendNode = findSendNode(updatedRoot)
-                                if (updatedSendNode == null) {
-                                    Log.i(TAG, "[WA_SEND_VERIFIED] WhatsApp message send verified: send button converted/dismissed on $pkg")
-                                    return true
+                                if (inputCleared && messageAppeared) {
+                                    Log.i(TAG, "[WA_SEND_VERIFIED] Verified message '$messageText' appeared in intended conversation '$postSendHeader' on $updatedPkg")
+                                    return WhatsAppSendVerificationResult(
+                                        isSentAndVerified = true,
+                                        verifiedChatTitle = postSendHeader,
+                                        verifiedPackage = updatedPkg,
+                                        failureReason = WhatsAppSendFailureReason.NONE,
+                                        details = "Message verified in conversation '$postSendHeader'"
+                                    )
                                 }
                             }
-                            Log.w(TAG, "[WA_SEND_FALSE_SUCCESS_BLOCKED] Click dispatched but WhatsApp send could not be verified on $pkg")
-                        }
-                    } else {
-                        // Fallback: Locate button immediately adjacent to inputNode or standard bottom-right area
-                        if (!messageText.isNullOrBlank() && inputNode != null) {
-                            val inRect = Rect()
-                            inputNode.getBoundsInScreen(inRect)
-                            val targetX = resources.displayMetrics.widthPixels * 0.92f
-                            val targetY = if (inRect.centerY() > 100) inRect.centerY().toFloat() else resources.displayMetrics.heightPixels * 0.92f
-                            Log.d(TAG, "Attempting coordinate tap on WhatsApp send area ($targetX, $targetY)")
-                            val tapped = performTap(targetX, targetY)
-                            Log.i(TAG, "[WA_SEND_CLICKED] coordinate tapped=$tapped ($targetX, $targetY)")
-                            if (tapped) {
-                                for (vAttempt in 0 until 5) {
-                                    try { Thread.sleep(300) } catch (_: InterruptedException) {}
-                                    val updatedRoot = rootInActiveWindow ?: continue
-                                    val updatedInput = updatedRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: findEditableNode(updatedRoot)
-                                    val remainingText = updatedInput?.text?.toString() ?: ""
-                                    if (remainingText.isBlank() || !remainingText.contains(messageText)) {
-                                        Log.i(TAG, "[WA_SEND_VERIFIED] WhatsApp message send verified via coordinate tap on $pkg")
-                                        return true
-                                    }
-                                }
-                                Log.w(TAG, "[WA_SEND_FALSE_SUCCESS_BLOCKED] Coordinate tap dispatched but WhatsApp send could not be verified on $pkg")
-                            }
+                            Log.w(TAG, "[WA_SEND_FALSE_SUCCESS_BLOCKED] Click dispatched in '$preSendHeader' but message appearance could not be verified on $pkg")
+                            return WhatsAppSendVerificationResult(
+                                isSentAndVerified = false,
+                                verifiedChatTitle = preSendHeader,
+                                verifiedPackage = pkg,
+                                failureReason = WhatsAppSendFailureReason.MESSAGE_APPEARANCE_UNVERIFIED,
+                                details = "Message appearance in conversation '$preSendHeader' could not be verified"
+                            )
                         }
                     }
                 }
@@ -1663,8 +2099,39 @@ class AffyAccessibilityService : AccessibilityService() {
             try { Thread.sleep(350) } catch (_: InterruptedException) {}
         }
 
-        Log.w(TAG, "Could not automate WhatsApp send after polling")
-        return false
+        val finalReason = when {
+            sawPackageMismatch -> WhatsAppSendFailureReason.PACKAGE_MISMATCH
+            sawChatIdentityMismatch -> WhatsAppSendFailureReason.CHAT_IDENTITY_MISMATCH
+            requiresExplicitTargetCheck && lastDetectedHeader.isNullOrBlank() -> WhatsAppSendFailureReason.CHAT_IDENTITY_UNCONFIRMED
+            requiresExplicitTargetCheck -> WhatsAppSendFailureReason.CHAT_IDENTITY_MISMATCH
+            lastDetectedHeader.isNullOrBlank() -> WhatsAppSendFailureReason.CHAT_IDENTITY_UNCONFIRMED
+            else -> WhatsAppSendFailureReason.INPUT_OR_SEND_NOT_FOUND
+        }
+        Log.w(TAG, "Could not automate WhatsApp send after polling (reason=$finalReason, lastHeader=$lastDetectedHeader, lastPkg=$lastDetectedPkg)")
+        return WhatsAppSendVerificationResult(
+            isSentAndVerified = false,
+            verifiedChatTitle = lastDetectedHeader,
+            verifiedPackage = lastDetectedPkg,
+            failureReason = finalReason,
+            details = "Send failed with reason $finalReason"
+        )
+    }
+
+    /**
+     * Backward-compatible wrapper around automateWhatsAppSendVerified.
+     */
+    fun automateWhatsAppSend(
+        targetPackage: String? = null,
+        messageText: String? = null,
+        expectedRecipient: String? = null,
+        expectedPhone: String? = null
+    ): Boolean {
+        return automateWhatsAppSendVerified(
+            targetPackage = targetPackage,
+            messageText = messageText,
+            expectedRecipient = expectedRecipient,
+            expectedPhone = expectedPhone
+        ).isSentAndVerified
     }
 
     fun performTap(x: Float, y: Float): Boolean {

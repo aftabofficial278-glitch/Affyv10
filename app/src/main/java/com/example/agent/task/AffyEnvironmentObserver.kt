@@ -67,6 +67,38 @@ class AffyEnvironmentObserver(
                 verifyWhatsAppOutcome(step.target, accessibility)
             }
 
+            ActionTypes.CHATGPT_GENERATE_IMAGE -> {
+                val wf = com.example.agent.AffyConversationContextManager.getInstance().getActiveTaskWorkflow()
+                val submitted = wf != null && (wf.stage == com.example.agent.WorkflowStage.PROMPT_SUBMITTED ||
+                        wf.stage == com.example.agent.WorkflowStage.GENERATING_IMAGE ||
+                        wf.stage == com.example.agent.WorkflowStage.IMAGE_READY)
+                VerificationResult(
+                    isVerified = submitted,
+                    observation = wf?.lastObservedStatus ?: "ChatGPT prompt submission checked.",
+                    failureReason = if (!submitted) (wf?.lastObservedStatus ?: "ChatGPT prompt submission could not be verified on screen.") else null
+                )
+            }
+
+            ActionTypes.DOWNLOAD_CHATGPT_IMAGE -> {
+                val wf = com.example.agent.AffyConversationContextManager.getInstance().getActiveTaskWorkflow()
+                val downloaded = wf != null && wf.stage == com.example.agent.WorkflowStage.IMAGE_DOWNLOADED
+                VerificationResult(
+                    isVerified = downloaded,
+                    observation = wf?.lastObservedStatus ?: "ChatGPT image download verification checked.",
+                    failureReason = if (!downloaded) (wf?.lastObservedStatus ?: "Download status message could not be verified.") else null
+                )
+            }
+
+            ActionTypes.SET_WALLPAPER -> {
+                val wf = com.example.agent.AffyConversationContextManager.getInstance().getActiveTaskWorkflow()
+                val applied = wf != null && wf.stage == com.example.agent.WorkflowStage.WALLPAPER_APPLIED
+                VerificationResult(
+                    isVerified = applied,
+                    observation = wf?.lastObservedStatus ?: "Wallpaper application verification checked.",
+                    failureReason = if (!applied) (wf?.lastObservedStatus ?: "Wallpaper application could not be verified.") else null
+                )
+            }
+
             ActionTypes.CHECK_GMAIL, ActionTypes.READ_GMAIL, "CHECK_ATTACHMENT" -> {
                 VerificationResult(
                     isVerified = true,
@@ -344,9 +376,43 @@ class AffyEnvironmentObserver(
     }
 
     private fun verifyWhatsAppOutcome(target: String?, accessibility: AffyAccessibilityService?): VerificationResult {
+        if (accessibility == null) {
+            return VerificationResult(
+                isVerified = false,
+                observation = "Accessibility service inactive during WhatsApp verification.",
+                failureReason = "Cannot verify WhatsApp conversation without Accessibility service."
+            )
+        }
+        val freshRoot = accessibility.getFreshActiveWindowRoot()
+        if (freshRoot == null) {
+            return VerificationResult(
+                isVerified = false,
+                observation = "No active window root available for WhatsApp verification.",
+                failureReason = "Could not inspect active WhatsApp window."
+            )
+        }
+        val activePkg = freshRoot.packageName?.toString() ?: ""
+        if (!com.example.service.WhatsAppInstanceManager.isWhatsAppPackage(activePkg)) {
+            return VerificationResult(
+                isVerified = false,
+                observation = "Active window package '$activePkg' is not a WhatsApp instance.",
+                failureReason = "WhatsApp conversation window is not in foreground."
+            )
+        }
+        val headerTitle = accessibility.extractActiveWhatsAppChatTitle(freshRoot)
+        if (!target.isNullOrBlank() && !headerTitle.isNullOrBlank()) {
+            val matches = com.example.agent.ContactResolver.doesIdentityMatch(headerTitle, target)
+            if (!matches) {
+                return VerificationResult(
+                    isVerified = false,
+                    observation = "Active WhatsApp chat header '$headerTitle' does not match intended target '$target'.",
+                    failureReason = "Conversation identity mismatch ('$headerTitle' vs '$target')."
+                )
+            }
+        }
         return VerificationResult(
             isVerified = true,
-            observation = "WhatsApp automation executed and chat screen observed."
+            observation = "WhatsApp conversation verified${if (!headerTitle.isNullOrBlank()) " for '$headerTitle'" else ""} in $activePkg."
         )
     }
 

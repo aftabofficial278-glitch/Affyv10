@@ -173,4 +173,54 @@ class AffyCriticalPipelineTest {
         assertTrue(sendSuccess!!.isSuccess)
         assertEquals("com.whatsapp.w4b", sendSuccess.selectedPackage)
     }
+
+    @Test
+    fun testNotificationTargetBindingAndStaleInvalidation() {
+        val contextManager = com.example.agent.AffyConversationContextManager.getInstance()
+        contextManager.clearActiveNotificationContext()
+
+        // 1. Older notification from Ali on regular WhatsApp
+        contextManager.updateActiveNotification(
+            sender = "Ali",
+            message = "Kahan ho?",
+            packageName = "com.whatsapp",
+            conversationTitle = "Ali Khan",
+            notificationKey = "notif_key_ali"
+        )
+        assertEquals("Ali", contextManager.resolveContextualRecipient("isko"))
+        assertEquals("Ali Khan", contextManager.getSnapshot().activeNotificationConversationTitle)
+        assertEquals("com.whatsapp", contextManager.getSnapshot().activeNotificationPackage)
+
+        // 2. New friend's notification from Bilal on WhatsApp Business replaces active target
+        contextManager.updateActiveNotification(
+            sender = "Bilal",
+            message = "Meeting start ho gayi",
+            packageName = "com.whatsapp.w4b",
+            conversationTitle = "Bilal Ahmed",
+            notificationKey = "notif_key_bilal"
+        )
+        assertEquals("Bilal", contextManager.resolveContextualRecipient("use"))
+        assertEquals("Bilal Ahmed", contextManager.getSnapshot().activeNotificationConversationTitle)
+        assertEquals("com.whatsapp.w4b", contextManager.getSnapshot().activeNotificationPackage)
+
+        // 3. Explicit reply to a different person invalidates stale notification target
+        contextManager.invalidateStaleNotificationIfTargetChanged("Hamza")
+        assertEquals(null, contextManager.getSnapshot().activeNotificationSender)
+        assertEquals(null, contextManager.getSnapshot().activeNotificationPackage)
+    }
+
+    @Test
+    fun testPhoneValidationAndStrictRecipientIdentityMatching() {
+        // Phone validation prevents guessed/invalid wa.me numbers
+        assertTrue(com.example.agent.ContactResolver.isValidPhoneNumber("+923001234567"))
+        assertTrue(com.example.agent.ContactResolver.isValidPhoneNumber("03001234567"))
+        org.junit.Assert.assertFalse(com.example.agent.ContactResolver.isValidPhoneNumber(""))
+        org.junit.Assert.assertFalse(com.example.agent.ContactResolver.isValidPhoneNumber("12345"))
+        org.junit.Assert.assertFalse(com.example.agent.ContactResolver.isValidPhoneNumber("0000000000"))
+
+        // Strict recipient identity matching prevents older chat reuse
+        assertTrue(com.example.agent.ContactResolver.doesIdentityMatch("Bilal Ahmed", "Bilal"))
+        org.junit.Assert.assertFalse(com.example.agent.ContactResolver.doesIdentityMatch("Ali Khan", "Bilal"))
+        org.junit.Assert.assertFalse(com.example.agent.ContactResolver.doesIdentityMatch("Alia", "Ali"))
+    }
 }

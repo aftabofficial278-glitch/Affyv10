@@ -2,11 +2,11 @@ name: Build AFFY Debug APK
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
     tags:
       - 'v*'
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
     inputs:
       create_release:
@@ -43,6 +43,10 @@ jobs:
         with:
           cache-read-only: false
 
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
       - name: Prepare Build Environment
         run: |
           # Ensure .env file exists with valid keys for Secrets Gradle Plugin
@@ -68,6 +72,8 @@ jobs:
               keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
             fi
           fi
+          mkdir -p ~/.android
+          cp -f debug.keystore ~/.android/debug.keystore || true
 
       - name: Make Gradle Wrapper Executable
         run: chmod +x gradlew
@@ -76,7 +82,7 @@ jobs:
         run: ./gradlew --version
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace --no-daemon
+        run: ./gradlew assembleDebug --stacktrace --no-daemon -Dorg.gradle.jvmargs="-Xmx2560m -XX:MaxMetaspaceSize=512m"
 
       - name: Upload Build Reports on Failure
         if: failure()

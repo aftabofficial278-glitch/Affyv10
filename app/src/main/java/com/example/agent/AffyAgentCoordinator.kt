@@ -352,6 +352,7 @@ class AffyAgentCoordinator(
                 when (liveState) {
                     com.example.voice.LiveSessionState.STREAMING_AUDIO -> {
                         thinkingWatchdogJob?.cancel()
+                        textToSpeech?.stop()
                         _uiState.update { it.copy(state = AffyState.SPEAKING, errorMessage = null) }
                     }
                     com.example.voice.LiveSessionState.EXECUTING_TOOL -> {
@@ -421,6 +422,10 @@ class AffyAgentCoordinator(
                 }
             }
         )
+
+        audioStreamer?.isPlaybackActive = {
+            geminiLiveSession?.isAudioPlayingOut() == true || textToSpeech?.engineState?.value == com.example.voice.TtsEngineState.SPEAKING
+        }
 
         speechRecognizer = AffySpeechRecognizer(
             context = context,
@@ -1165,6 +1170,7 @@ class AffyAgentCoordinator(
 
             withContext(Dispatchers.Main) {
                 if (currentExecutionToken != token) return@withContext
+                geminiLiveSession?.interruptPlayback()
                 textToSpeech?.speak(finalReply) {
                     if (currentExecutionToken != token) return@speak
                     startContinuousListeningWindow()
@@ -1631,6 +1637,7 @@ class AffyAgentCoordinator(
             // Voice output
             withContext(Dispatchers.Main) {
                 if (currentExecutionToken != token) return@withContext
+                geminiLiveSession?.interruptPlayback()
                 textToSpeech?.speak(finalSpeech) {
                     if (currentExecutionToken != token) return@speak
                     if (plan.intent == ActionTypes.STOP_CANCEL || plan.intent == ActionTypes.DEACTIVATE_OVERLAY) {

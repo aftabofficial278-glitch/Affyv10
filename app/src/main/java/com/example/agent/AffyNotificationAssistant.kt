@@ -40,11 +40,14 @@ data class RecentReceivedMessage(
     val id: String = UUID.randomUUID().toString(),
     val packageName: String,
     val sender: String,
+    val conversationTitle: String = sender,
+    val sbnKey: String = "",
     val senderCleanName: String,
     val isUnknownNumber: Boolean,
     val messageText: String,
     val timestamp: Long = System.currentTimeMillis(),
-    val notification: Notification? = null
+    val notification: Notification? = null,
+    @Volatile var replied: Boolean = false
 )
 
 /**
@@ -55,6 +58,8 @@ data class ImmutableNotificationTarget(
     val executionId: String = UUID.randomUUID().toString(),
     val packageName: String,
     val sender: String,
+    val conversationTitle: String = sender,
+    val sbnKey: String = "",
     val messageText: String,
     val notification: Notification,
     val timestamp: Long = System.currentTimeMillis()
@@ -87,6 +92,8 @@ class AffyNotificationAssistant(
 
     private var activePendingNotification: ImmutableNotificationTarget? = null
     private var stagedReplyText: String? = null
+    @Volatile
+    private var ambiguousRecentSenders: List<String> = emptyList()
 
     // In-memory queue of recent received messages (WhatsApp, SMS, etc.)
     private val recentReceivedMessages = ConcurrentLinkedDeque<RecentReceivedMessage>()
@@ -252,6 +259,9 @@ class AffyNotificationAssistant(
             val now = System.currentTimeMillis()
 
             val notification = sbn.notification ?: return@launch
+            if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) {
+                return@launch // Ignore group summary notifications so individual chat identity is never overwritten
+            }
             val extras = notification.extras ?: return@launch
 
             // Extract using MessagingStyle if available
@@ -267,6 +277,18 @@ class AffyNotificationAssistant(
                 rawTitle = rawTitle.substringBefore("(").trim()
             }
 
+            var convTitle = messagingStyle?.conversationTitle?.toString()?.trim()
+                ?: extras.getCharSequence(NotificationCompat.EXTRA_CONVERSATION_TITLE)?.toString()?.trim()
+                ?: extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
+                ?: rawTitle
+
+            if (convTitle.contains("(") && convTitle.contains("message", ignoreCase = true)) {
+                convTitle = convTitle.substringBefore("(").trim()
+            }
+            if (convTitle.isBlank()) {
+                convTitle = rawTitle
+            }
+
             val text = latestMsg?.text?.toString()?.trim()
                 ?: (extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
                     ?: extras.getCharSequence(Notification.EXTRA_TEXT))?.toString()?.trim()
@@ -280,7 +302,7 @@ class AffyNotificationAssistant(
             }
 
             // Deduplication by sender + message + pkg + sbn key within 20 seconds
-            val sbnKey = sbn.key ?: "${sbn.id}"
+            val sbnKey = sbn.key ?: "${pkg}_${sbn.id}"
             val messageHash = "$pkg::$rawTitle::${text.take(40).lowercase()}::$sbnKey"
             val lastSeen = recentNotificationHashes[messageHash] ?: 0L
             if (now - lastSeen < 20_000L) {
@@ -305,6 +327,8 @@ class AffyNotificationAssistant(
             val receivedMessage = RecentReceivedMessage(
                 packageName = pkg,
                 sender = rawTitle,
+                conversationTitle = convTitle,
+                sbnKey = sbnKey,
                 senderCleanName = cleanSenderName,
                 isUnknownNumber = isUnknownNumber,
                 messageText = text,
@@ -335,21 +359,28 @@ class AffyNotificationAssistant(
                 Log.w(TAG, "Failed to persist notification to DB: ${e.message}")
             }
 
-            // Update active conversation context with this notification
+            // Update active conversation context with this notification (invalidates any previous sender context)
             AffyConversationContextManager.getInstance().updateActiveNotification(
                 sender = rawTitle,
                 message = text,
-                packageName = pkg
+                packageName = pkg,
+                conversationTitle = convTitle,
+                notificationKey = sbnKey
             )
 
             // IMMUTABLE TARGET LOCK (Phase 4.9)
             val immutableTarget = ImmutableNotificationTarget(
                 packageName = pkg,
                 sender = rawTitle,
+                conversationTitle = convTitle,
+                sbnKey = sbnKey,
                 messageText = text,
                 notification = notification,
                 timestamp = now
             )
+
+            // Clear any previous multi-sender ambiguity since a new latest notification arrived
+            ambiguousRecentSenders = emptyList()
 
             // 1. Check if this chat has ACTIVE AUTONOMOUS AUTHORIZATION (Phase 4.5 D & 4.6)
             if (isChatAuthorized(rawTitle, pkg)) {
@@ -363,9 +394,15 @@ class AffyNotificationAssistant(
 
                 // Generate contextual reply
                 val autoReplyText = generateContextualReply(rawTitle, text)
-                val sent = sendDirectReply(notification, autoReplyText)
+                val sent = sendDirectReply(
+                    notification = notification,
+                    replyText = autoReplyText,
+                    expectedSender = rawTitle,
+                    expectedConversation = convTitle
+                )
 
                 if (sent) {
+                    receivedMessage.replied = true
                     Log.i(TAG, "[WA_AUTONOMOUS_REPLY_VERIFIED] Reply sent to '$rawTitle' via RemoteInput: '$autoReplyText'")
                     AffyDiagnostics.logWhatsAppStage(
                         stage = "WA_BG_REPLY_VERIFIED",
@@ -388,14 +425,19 @@ class AffyNotificationAssistant(
             }
 
             // 2. Normal Interactive Flow (IDENTIFY -> ASK -> READ -> USER DECISION)
-            // Check if assistant is currently busy with another prompt
+            // Always invalidate any stale pending notification from an older chat so a reply never goes to the previous sender!
             val currentState = _assistantState.value
             val pending = activePendingNotification
-            if (currentState != NotificationAssistantState.IDLE) {
-                if (pending != null && now - pending.timestamp > 25_000L) {
+            if (currentState != NotificationAssistantState.IDLE && pending != null) {
+                val isSameChat = ContactResolver.doesIdentityMatch(pending.sender, rawTitle) &&
+                        pending.packageName.equals(pkg, ignoreCase = true)
+                if (!isSameChat || (now - pending.timestamp > 25_000L)) {
+                    Log.i(TAG, "[WA_STALE_TARGET_CLEARED] Clearing previous pending target '${pending.sender}' (${pending.packageName}) for new notification from '$rawTitle' ($pkg)")
                     reset()
                 } else {
-                    Log.d(TAG, "Assistant is actively interacting (${currentState}). Skipping new prompt.")
+                    // Same sender sent another message while interacting: update locked target to newest notification
+                    activePendingNotification = immutableTarget
+                    Log.d(TAG, "Updated activePendingNotification to newest message from $rawTitle on $pkg")
                     return@launch
                 }
             }
@@ -694,52 +736,191 @@ class AffyNotificationAssistant(
 
     private suspend fun dispatchReply(pending: ImmutableNotificationTarget, replyText: String) {
         val pkg = pending.packageName
-        Log.i(TAG, "[WA_BG_REPLY_STARTED] Dispatching locked target reply to ${pending.sender} via $pkg: '$replyText'")
+        val expectedChat = pending.conversationTitle.ifBlank { pending.sender }
+        Log.i(TAG, "[WA_BG_REPLY_STARTED] Dispatching locked target reply to ${pending.sender} (chat='$expectedChat') via $pkg: '$replyText'")
 
-        // 1. Direct Reply via Notification RemoteInput (Background, no UI)
-        var sent = sendDirectReply(pending.notification, replyText)
-
-        // 2. Fallback via Accessibility Service only if RemoteInput is genuinely unavailable
-        if (!sent) {
-            try {
-                if (pending.notification.contentIntent != null) {
-                    pending.notification.contentIntent.send()
-                    delay(1000)
-                    val a11y = AffyAccessibilityService.instance
-                    if (a11y != null) {
-                        sent = a11y.automateWhatsAppSend(targetPackage = pkg, messageText = replyText)
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Fallback send failed: ${e.message}")
-            }
+        if (pending.sender.isBlank() || pending.sender.equals("Kisi", ignoreCase = true)) {
+            reset()
+            speakAudible("Boss, kis chat mein reply bhejna hai confirm nahi ho saka. Kripya naam batayein.", null)
+            return
         }
 
+        val (sent, spokenFeedback) = sendBoundNotificationReply(
+            packageName = pkg,
+            sender = pending.sender,
+            conversationTitle = expectedChat,
+            notification = pending.notification,
+            replyText = replyText
+        )
+
+        if (sent) {
+            markSenderMessagesReplied(pending.sender, pkg)
+        }
         reset()
+        AffyConversationContextManager.getInstance().clearActiveNotificationContext()
 
         if (sent) {
             AffyDiagnostics.logWhatsAppStage(
                 stage = "WA_BG_REPLY_VERIFIED",
                 packageName = pkg,
                 sender = pending.sender,
-                details = "Reply sent: '$replyText'",
+                details = "Reply sent and verified: '$replyText'",
                 isSuccess = true
             )
-            speakAudible("Boss, reply bhej diya.", null)
+            speakAudible("Boss, ${pending.sender} ko reply bhej diya.", null)
         } else {
             AffyDiagnostics.logWhatsAppStage(
                 stage = "WA_BG_REPLY_UNSUPPORTED",
                 packageName = pkg,
                 sender = pending.sender,
-                details = "Could not send reply via RemoteInput or Accessibility",
+                details = spokenFeedback,
                 isSuccess = false,
-                failureReason = "Direct reply failed"
+                failureReason = spokenFeedback
             )
-            speakAudible("Boss, background reply available nahi ho saka.", null)
+            speakAudible(spokenFeedback, null)
         }
     }
 
-    private fun sendDirectReply(notification: Notification, replyText: String): Boolean {
+    /**
+     * Executes a reply strictly bound to a notification's sender, conversation identity, and originating package.
+     * Opens/verifies the intended conversation via fresh Accessibility UI when available, or uses verified RemoteInput
+     * only when the notification's embedded identity matches the target.
+     */
+    private suspend fun sendBoundNotificationReply(
+        packageName: String,
+        sender: String,
+        conversationTitle: String,
+        notification: Notification?,
+        replyText: String
+    ): Pair<Boolean, String> {
+        val expectedChat = conversationTitle.ifBlank { sender }
+        val a11y = AffyAccessibilityService.instance
+
+        // When Accessibility Service is active and target is WhatsApp, open/verify the exact conversation on screen
+        // and confirm the message appears in the intended conversation (Requirements 2, 4, 6).
+        if (a11y != null && WhatsAppInstanceManager.isWhatsAppPackage(packageName)) {
+            try {
+                val rootPkg = a11y.getFreshActiveWindowRoot()?.packageName?.toString() ?: ""
+                val activeHeader = if (rootPkg.equals(packageName, ignoreCase = true)) {
+                    a11y.extractActiveWhatsAppChatTitle()
+                } else null
+
+                val alreadyInTargetChat = !activeHeader.isNullOrBlank() &&
+                        ContactResolver.doesIdentityMatch(activeHeader, expectedChat)
+
+                if (!alreadyInTargetChat) {
+                    if (notification?.contentIntent != null) {
+                        notification.contentIntent.send()
+                        delay(900)
+                    } else {
+                        val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
+                        if (launchIntent != null) {
+                            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            context.startActivity(launchIntent)
+                            delay(900)
+                        }
+                    }
+                }
+
+                val verifyResult = a11y.automateWhatsAppSendVerified(
+                    targetPackage = packageName,
+                    messageText = replyText,
+                    expectedRecipient = expectedChat
+                )
+
+                if (verifyResult.isSentAndVerified) {
+                    return Pair(true, "Ho gaya Boss. $sender ko reply bhej diya.")
+                }
+
+                if (verifyResult.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.CHAT_IDENTITY_MISMATCH ||
+                    verifyResult.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.CHAT_IDENTITY_UNCONFIRMED ||
+                    verifyResult.failureReason == AffyAccessibilityService.WhatsAppSendFailureReason.PACKAGE_MISMATCH
+                ) {
+                    return Pair(
+                        false,
+                        "Boss, $sender ki exact chat confirm nahi ho saki. Aap kis chat mein reply bhejna chahte hain?"
+                    )
+                }
+
+                return Pair(
+                    false,
+                    "Boss, $sender ki chat mein message send verify nahi ho saka."
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Bound accessibility reply failed for $sender: ${e.message}")
+            }
+        }
+
+        // Background RemoteInput path (only when notification identity is strictly verified to match expected sender/chat)
+        if (notification != null) {
+            val remoteSent = sendDirectReply(
+                notification = notification,
+                replyText = replyText,
+                expectedSender = sender,
+                expectedConversation = expectedChat
+            )
+            if (remoteSent) {
+                // If Accessibility is active on this chat, also check if message appeared; otherwise report RemoteInput dispatch
+                return Pair(true, "Ho gaya Boss. $sender ko reply bhej diya.")
+            }
+        }
+
+        return Pair(
+            false,
+            "Boss, $sender ki exact chat verify nahi ho saki. Aap kis chat mein reply bhejna chahte hain?"
+        )
+    }
+
+    private fun verifyNotificationIdentityMatches(
+        notification: Notification,
+        expectedSender: String?,
+        expectedConversation: String?
+    ): Boolean {
+        if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) {
+            Log.w(TAG, "[WA_REMOTE_INPUT_BLOCKED] Rejecting group summary notification")
+            return false
+        }
+        if (expectedSender.isNullOrBlank() && expectedConversation.isNullOrBlank()) return false
+
+        val extras = notification.extras ?: return false
+        val messagingStyle = NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(notification)
+        val latestMsg = messagingStyle?.messages?.lastOrNull()
+
+        val notifSender = latestMsg?.person?.name?.toString()?.trim()
+            ?: extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
+            ?: ""
+        val notifConv = messagingStyle?.conversationTitle?.toString()?.trim()
+            ?: extras.getCharSequence(NotificationCompat.EXTRA_CONVERSATION_TITLE)?.toString()?.trim()
+            ?: notifSender
+
+        val matchesSender = !expectedSender.isNullOrBlank() &&
+                (ContactResolver.doesIdentityMatch(notifSender, expectedSender) ||
+                        ContactResolver.doesIdentityMatch(notifConv, expectedSender))
+        val matchesConv = !expectedConversation.isNullOrBlank() &&
+                (ContactResolver.doesIdentityMatch(notifConv, expectedConversation) ||
+                        ContactResolver.doesIdentityMatch(notifSender, expectedConversation))
+
+        if (!matchesSender && !matchesConv) {
+            Log.e(TAG, "[WA_REMOTE_INPUT_MISMATCH_BLOCKED] Notification identity (sender='$notifSender', conv='$notifConv') != expected (sender='$expectedSender', conv='$expectedConversation')")
+            return false
+        }
+        return true
+    }
+
+    private fun sendDirectReply(
+        notification: Notification,
+        replyText: String,
+        expectedSender: String? = null,
+        expectedConversation: String? = null
+    ): Boolean {
+        if (!expectedSender.isNullOrBlank() || !expectedConversation.isNullOrBlank()) {
+            if (!verifyNotificationIdentityMatches(notification, expectedSender, expectedConversation)) {
+                return false
+            }
+        } else if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) {
+            return false
+        }
+
         // 1. Check NotificationCompat actions
         val compatCount = NotificationCompat.getActionCount(notification)
         for (i in 0 until compatCount) {
@@ -755,7 +936,7 @@ class AffyNotificationAssistant(
                 androidx.core.app.RemoteInput.addResultsToIntent(remoteInputs, fillInIntent, bundle)
                 try {
                     pendingIntent.send(context, 0, fillInIntent)
-                    Log.i(TAG, "[WA_BG_REPLY_REMOTE_INPUT_FOUND] Direct reply dispatched via NotificationCompat action $i")
+                    Log.i(TAG, "[WA_BG_REPLY_REMOTE_INPUT_FOUND] Direct reply dispatched via NotificationCompat action $i for ${expectedSender ?: "chat"}")
                     return true
                 } catch (e: Exception) {
                     Log.w(TAG, "NotificationCompat action $i send failed: ${e.message}")
@@ -778,7 +959,7 @@ class AffyNotificationAssistant(
                     android.app.RemoteInput.addResultsToIntent(remoteInputs, fillInIntent, bundle)
                     try {
                         pendingIntent.send(context, 0, fillInIntent)
-                        Log.i(TAG, "[WA_BG_REPLY_REMOTE_INPUT_FOUND] Direct reply dispatched via standard action")
+                        Log.i(TAG, "[WA_BG_REPLY_REMOTE_INPUT_FOUND] Direct reply dispatched via standard action for ${expectedSender ?: "chat"}")
                         return true
                     } catch (e: Exception) {
                         Log.e(TAG, "Direct reply failed: ${e.message}")
@@ -806,10 +987,12 @@ class AffyNotificationAssistant(
 
     /**
      * Generates a natural, human-like conversational summary of recent notifications.
+     * Also updates the bound reply target to the newly read notification (or marks ambiguity if multiple senders were read).
      */
     fun getNaturalSummaryOfRecentMessages(appFilter: String? = "whatsapp"): String {
-        val messages = getRecentMessages(appFilter)
-        if (messages.isEmpty()) {
+        val allRecent = getRecentMessages(appFilter)
+        val unreadOrFresh = allRecent.filter { !it.replied }.ifEmpty { allRecent }
+        if (unreadOrFresh.isEmpty()) {
             return if (appFilter.equals("whatsapp", ignoreCase = true)) {
                 "Boss, abhi WhatsApp pe koi naya message nahi aya hai."
             } else {
@@ -817,12 +1000,18 @@ class AffyNotificationAssistant(
             }
         }
 
-        val groupedBySender = messages.groupBy { it.sender }
+        val groupedBySender = unreadOrFresh.groupBy { "${it.packageName}::${it.sender}" }
         val senderSummaries = mutableListOf<String>()
+        val distinctSenderNames = mutableListOf<String>()
 
-        for ((sender, msgs) in groupedBySender) {
-            val isUnknown = msgs.firstOrNull()?.isUnknownNumber == true
-            val latestText = msgs.firstOrNull()?.messageText ?: ""
+        for ((_, msgs) in groupedBySender) {
+            val latest = msgs.first()
+            val sender = latest.sender
+            distinctSenderNames.add(sender)
+            AffyConversationContextManager.getInstance().markNotificationRead(sender)
+
+            val isUnknown = latest.isUnknownNumber
+            val latestText = latest.messageText
             val count = msgs.size
 
             val summaryPart = when {
@@ -834,91 +1023,233 @@ class AffyNotificationAssistant(
             senderSummaries.add(summaryPart)
         }
 
-        val totalMsgs = messages.size
+        // Synchronize pending reply target with the notification(s) just read!
+        if (groupedBySender.size == 1) {
+            val singleLatest = unreadOrFresh.first()
+            ambiguousRecentSenders = emptyList()
+            if (singleLatest.notification != null) {
+                activePendingNotification = ImmutableNotificationTarget(
+                    packageName = singleLatest.packageName,
+                    sender = singleLatest.sender,
+                    conversationTitle = singleLatest.conversationTitle,
+                    sbnKey = singleLatest.sbnKey,
+                    messageText = singleLatest.messageText,
+                    notification = singleLatest.notification,
+                    timestamp = singleLatest.timestamp
+                )
+            }
+            AffyConversationContextManager.getInstance().updateActiveNotification(
+                sender = singleLatest.sender,
+                message = singleLatest.messageText,
+                packageName = singleLatest.packageName,
+                conversationTitle = singleLatest.conversationTitle,
+                notificationKey = singleLatest.sbnKey
+            )
+            Log.i(TAG, "[WA_READ_TARGET_BOUND] Bound active reply target to newly read sender '${singleLatest.sender}' (${singleLatest.packageName})")
+        } else {
+            // Multiple friends' notifications were read together: clear single assumed target so a generic reply asks which chat!
+            activePendingNotification = null
+            ambiguousRecentSenders = distinctSenderNames.distinct()
+            AffyConversationContextManager.getInstance().clearActiveNotificationContext()
+            Log.i(TAG, "[WA_READ_MULTIPLE_SENDERS] Multiple senders read ($ambiguousRecentSenders); cleared single target assumption")
+        }
+
+        val totalMsgs = unreadOrFresh.size
         val countWord = if (totalMsgs == 1) "ek message aya hai" else "$totalMsgs messages aaye hain"
         val joined = senderSummaries.joinToString(" aur ")
 
         return "Boss, $countWord. $joined."
     }
 
+    fun isContextualPronoun(reference: String): Boolean {
+        val clean = reference.lowercase().trim()
+        if (clean.isBlank()) return true
+        val exactPronouns = setOf(
+            "iski", "iska", "isko", "ise", "isay", "uska", "uski", "usko", "use", "usay",
+            "unka", "unki", "unko", "inhe", "unhe", "inhein", "unhein", "is", "us", "ye",
+            "woh", "this", "him", "her", "them", "latest", "last", "recent", "notification",
+            "message", "reply", "sender", "haan", "yes", "is bande", "us bande"
+        )
+        if (clean in exactPronouns) return true
+        val pronounPhrases = listOf(
+            "isko ", "iski ", "iska ", "ise ", "isay ", "usko ", "uska ", "uski ", "use ", "usay ",
+            "unko ", "unka ", "inhe ", "unhe ", "is bande", "us bande", "latest message", "recent message"
+        )
+        return pronounPhrases.any { clean.startsWith(it) || clean.endsWith(it.trim()) }
+    }
+
+    fun hasAmbiguousRecentSenders(): Boolean {
+        return ambiguousRecentSenders.size > 1 && activePendingNotification == null
+    }
+
+    fun getAmbiguousSenderClarificationPrompt(): String {
+        val senders = ambiguousRecentSenders.take(4).joinToString(" ya ")
+        return if (senders.isNotBlank()) {
+            "Boss, abhi $senders ke messages aaye hain. Aap kis chat mein reply bhejna chahte hain?"
+        } else {
+            "Boss, kis chat mein reply bhejna hai? Naam bata dein."
+        }
+    }
+
+    /**
+     * Invalidates any stale pending notification target when a new reply or message request specifies a different target.
+     */
+    fun invalidateStaleTargetIfChanged(newTarget: String) {
+        val clean = newTarget.trim()
+        if (clean.isBlank() || isContextualPronoun(clean)) return
+        val pending = activePendingNotification
+        if (pending != null) {
+            val matchesPending = ContactResolver.doesIdentityMatch(pending.sender, clean) ||
+                    ContactResolver.doesIdentityMatch(pending.conversationTitle, clean)
+            if (!matchesPending) {
+                Log.i(TAG, "[WA_STALE_TARGET_INVALIDATED] Clearing pending notification for '${pending.sender}' because requested target is '$clean'")
+                reset()
+            }
+        }
+        AffyConversationContextManager.getInstance().invalidateStaleNotificationIfTargetChanged(clean)
+    }
+
+    fun markSenderMessagesReplied(sender: String, packageName: String? = null) {
+        for (msg in recentReceivedMessages) {
+            val senderMatch = ContactResolver.doesIdentityMatch(msg.sender, sender) ||
+                    ContactResolver.doesIdentityMatch(msg.conversationTitle, sender)
+            val pkgMatch = packageName.isNullOrBlank() || msg.packageName.equals(packageName, ignoreCase = true)
+            if (senderMatch && pkgMatch) {
+                msg.replied = true
+            }
+        }
+        val pending = activePendingNotification
+        if (pending != null && ContactResolver.doesIdentityMatch(pending.sender, sender)) {
+            reset()
+        }
+    }
+
+    /**
+     * Resolves a recipient reference to a recent notification message ONLY when the reference is either:
+     * 1) An unambiguous contextual pronoun pointing to a single active/recent notification, OR
+     * 2) An explicit name/number that strictly matches a recent notification's sender or conversationTitle.
+     * NEVER falls back to an older unrelated chat!
+     */
     fun resolveContextualSender(reference: String): RecentReceivedMessage? {
-        val cleanRef = reference.lowercase().trim()
-        val list = recentReceivedMessages.toList()
-        if (list.isEmpty()) return null
+        val now = System.currentTimeMillis()
+        val cleanRef = reference.trim()
+        val freshList = recentReceivedMessages.filter { (now - it.timestamp) <= 300_000L }
+        if (freshList.isEmpty()) return null
 
-        val active = activePendingNotification
-        if (active != null) {
-            val activeMsg = list.find { it.sender.equals(active.sender, ignoreCase = true) }
-            if (activeMsg != null) return activeMsg
+        // Case 1: Contextual pronoun ("isko", "iska", "uska", etc.)
+        if (isContextualPronoun(cleanRef)) {
+            if (ambiguousRecentSenders.size > 1 && activePendingNotification == null) {
+                Log.w(TAG, "[WA_AMBIGUOUS_PRONOUN_BLOCKED] Multiple recent senders ($ambiguousRecentSenders); refusing to guess for '$cleanRef'")
+                return null
+            }
+
+            val active = activePendingNotification
+            if (active != null && (now - active.timestamp) <= 300_000L) {
+                val activeMsg = freshList.firstOrNull {
+                    ContactResolver.doesIdentityMatch(it.sender, active.sender) &&
+                            it.packageName.equals(active.packageName, ignoreCase = true)
+                }
+                if (activeMsg != null) return activeMsg
+                return RecentReceivedMessage(
+                    packageName = active.packageName,
+                    sender = active.sender,
+                    conversationTitle = active.conversationTitle,
+                    sbnKey = active.sbnKey,
+                    senderCleanName = active.sender,
+                    isUnknownNumber = ContactResolver.isValidPhoneNumber(active.sender),
+                    messageText = active.messageText,
+                    timestamp = active.timestamp,
+                    notification = active.notification
+                )
+            }
+
+            val unreplied = freshList.filter { !it.replied }
+            val candidates = unreplied.ifEmpty { freshList.filter { (now - it.timestamp) <= 120_000L } }
+            val distinctConversations = candidates
+                .map { "${it.packageName.lowercase()}::${ContactResolver.normalizeName(it.conversationTitle.ifBlank { it.sender })}" }
+                .distinct()
+
+            if (distinctConversations.size == 1) {
+                return candidates.firstOrNull()
+            } else if (distinctConversations.size > 1) {
+                ambiguousRecentSenders = candidates.map { it.sender }.distinct()
+                Log.w(TAG, "[WA_MULTIPLE_UNREAD_SENDERS] Pronoun '$cleanRef' is ambiguous across $ambiguousRecentSenders")
+                return null
+            }
+            return null
         }
 
-        val isPronoun = cleanRef.contains("iski") || cleanRef.contains("iska") || cleanRef.contains("isko") ||
-                cleanRef.contains("uska") || cleanRef.contains("unka") || cleanRef.contains("inhe") ||
-                cleanRef.contains("unhe") || cleanRef.contains("latest") || cleanRef.contains("pehla") ||
-                cleanRef.contains("first") || cleanRef.contains("ye") || cleanRef.contains("chat") ||
-                cleanRef.contains("handle") || cleanRef == "haan" || cleanRef == "yes"
+        // Case 2: Explicit sender/chat name or phone number
+        invalidateStaleTargetIfChanged(cleanRef)
 
-        if (isPronoun) {
-            return list.firstOrNull()
+        val matchedMessages = freshList.filter { msg ->
+            ContactResolver.doesIdentityMatch(msg.sender, cleanRef) ||
+                    ContactResolver.doesIdentityMatch(msg.conversationTitle, cleanRef)
         }
 
-        val matched = list.firstOrNull { msg ->
-            msg.sender.contains(cleanRef, ignoreCase = true) || cleanRef.contains(msg.sender.lowercase())
+        if (matchedMessages.isEmpty()) {
+            Log.d(TAG, "[WA_NO_NOTIFICATION_MATCH] Explicit target '$cleanRef' did not match any recent notification sender; returning null")
+            return null
         }
-        if (matched != null) return matched
 
-        return list.firstOrNull()
+        val distinctMatchedConversations = matchedMessages
+            .map { "${it.packageName.lowercase()}::${ContactResolver.normalizeName(it.conversationTitle.ifBlank { it.sender })}" }
+            .distinct()
+
+        if (distinctMatchedConversations.size > 1) {
+            ambiguousRecentSenders = matchedMessages.map { "${it.sender} (${resolveAppName(it.packageName)})" }.distinct()
+            Log.w(TAG, "[WA_AMBIGUOUS_NOTIFICATION_MATCH] Target '$cleanRef' matched multiple conversations/packages: $ambiguousRecentSenders")
+            return null
+        }
+
+        ambiguousRecentSenders = emptyList()
+        return matchedMessages.first()
     }
 
     suspend fun executeDirectReply(recipientOrReference: String, replyText: String): Pair<Boolean, String> {
         val target = resolveContextualSender(recipientOrReference)
         if (target == null) {
-            return Pair(false, "Koi active message ya contact nahi mila jisko reply bheja ja sake.")
-        }
-
-        Log.i(TAG, "[WA_BG_REPLY_STARTED] Executing direct reply to ${target.sender} (${target.packageName}): '$replyText'")
-
-        var sent = false
-        if (target.notification != null) {
-            sent = sendDirectReply(target.notification, replyText)
-        }
-
-        if (!sent) {
-            try {
-                if (target.notification?.contentIntent != null) {
-                    target.notification.contentIntent.send()
-                    delay(1000)
-                    val a11y = AffyAccessibilityService.instance
-                    if (a11y != null) {
-                        sent = a11y.automateWhatsAppSend(targetPackage = target.packageName, messageText = replyText)
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Fallback accessibility reply failed: ${e.message}")
+            if (hasAmbiguousRecentSenders()) {
+                return Pair(false, getAmbiguousSenderClarificationPrompt())
             }
+            return Pair(false, "Boss, kis chat mein reply bhejna hai confirm nahi ho saka. Kripya naam batayein.")
         }
 
+        Log.i(TAG, "[WA_BG_REPLY_STARTED] Executing direct reply to ${target.sender} (conv='${target.conversationTitle}', pkg=${target.packageName}): '$replyText'")
+
+        val (sent, feedback) = sendBoundNotificationReply(
+            packageName = target.packageName,
+            sender = target.sender,
+            conversationTitle = target.conversationTitle,
+            notification = target.notification,
+            replyText = replyText
+        )
+
+        if (sent) {
+            markSenderMessagesReplied(target.sender, target.packageName)
+        }
         reset()
+        AffyConversationContextManager.getInstance().clearActiveNotificationContext()
 
         return if (sent) {
             AffyDiagnostics.logWhatsAppStage(
                 stage = "WA_BG_REPLY_VERIFIED",
                 packageName = target.packageName,
                 sender = target.sender,
-                details = "Reply sent: '$replyText'",
+                details = "Reply sent and verified: '$replyText'",
                 isSuccess = true
             )
-            Pair(true, "Ho gaya Boss. ${target.sender} ko reply bhej diya.")
+            Pair(true, feedback)
         } else {
             AffyDiagnostics.logWhatsAppStage(
                 stage = "WA_BG_REPLY_UNSUPPORTED",
                 packageName = target.packageName,
                 sender = target.sender,
-                details = "Could not send reply",
+                details = feedback,
                 isSuccess = false,
-                failureReason = "Failed to send via notification actions or accessibility"
+                failureReason = feedback
             )
-            Pair(false, "Boss, reply send nahi ho saka.")
+            Pair(false, feedback)
         }
     }
 

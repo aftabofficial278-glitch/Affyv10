@@ -136,18 +136,17 @@ object WhatsAppInstanceManager {
         val installed = getInstalledInstances(context)
         Log.i(TAG, "[WA_APP_DISCOVERY] Found ${installed.size} WhatsApp instances: ${installed.map { it.packageName }}")
         if (installed.isEmpty()) {
-            Log.i(TAG, "[WA_PACKAGE_SELECTED] No instance found, returning default $PKG_WHATSAPP")
-            return PKG_WHATSAPP
+            val fallback = preferredPackage?.takeIf { it.isNotBlank() } ?: PKG_WHATSAPP
+            Log.i(TAG, "[WA_PACKAGE_SELECTED] No instance found via PM, returning $fallback")
+            return fallback
         }
 
-        // 1. Check current foreground package from AccessibilityService
-        val foregroundPkg = AffyAccessibilityService.currentAppPackage.value
-        if (!foregroundPkg.isNullOrBlank() && isWhatsAppPackage(foregroundPkg)) {
-            val matchedForeground = installed.firstOrNull { it.packageName.equals(foregroundPkg, ignoreCase = true) }
-            if (matchedForeground != null) {
-                Log.i(TAG, "[WA_FOREGROUND_PACKAGE] Reusing active foreground WhatsApp instance: ${matchedForeground.packageName}")
-                Log.i(TAG, "[WA_PACKAGE_SELECTED] package=${matchedForeground.packageName} reason=foreground_active")
-                return matchedForeground.packageName
+        // 1. If preferred/originating package is explicitly provided, honor it first
+        if (!preferredPackage.isNullOrBlank()) {
+            val matched = installed.firstOrNull { it.packageName.equals(preferredPackage, ignoreCase = true) }
+            if (matched != null) {
+                Log.i(TAG, "[WA_PACKAGE_SELECTED] package=${matched.packageName} reason=explicit_or_originating_package")
+                return matched.packageName
             }
         }
 
@@ -160,12 +159,14 @@ object WhatsAppInstanceManager {
             }
         }
 
-        // 3. If preferred package configured and installed
-        if (!preferredPackage.isNullOrBlank()) {
-            val matched = installed.firstOrNull { it.packageName.equals(preferredPackage, ignoreCase = true) }
-            if (matched != null) {
-                Log.i(TAG, "[WA_PACKAGE_SELECTED] package=${matched.packageName} reason=user_preference")
-                return matched.packageName
+        // 3. Check current foreground package from AccessibilityService
+        val foregroundPkg = AffyAccessibilityService.currentAppPackage.value
+        if (!foregroundPkg.isNullOrBlank() && isWhatsAppPackage(foregroundPkg)) {
+            val matchedForeground = installed.firstOrNull { it.packageName.equals(foregroundPkg, ignoreCase = true) }
+            if (matchedForeground != null) {
+                Log.i(TAG, "[WA_FOREGROUND_PACKAGE] Reusing active foreground WhatsApp instance: ${matchedForeground.packageName}")
+                Log.i(TAG, "[WA_PACKAGE_SELECTED] package=${matchedForeground.packageName} reason=foreground_active")
+                return matchedForeground.packageName
             }
         }
 

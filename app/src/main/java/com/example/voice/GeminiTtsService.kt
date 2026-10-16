@@ -6,6 +6,9 @@ import android.media.MediaPlayer
 import android.util.Base64
 import android.util.Log
 import com.example.agent.AffyDiagnostics
+import com.example.agent.AffyEmotion
+import com.example.agent.AffyEmotionEngine
+import com.example.agent.EmotionalVoiceProfile
 import com.example.data.remote.GeminiApiService
 import com.example.data.remote.GeminiContent
 import com.example.data.remote.GeminiGenerateRequest
@@ -50,6 +53,7 @@ class GeminiTtsService(
         text: String,
         apiKey: String,
         voiceName: String = VOICE_PUCK_YOUNG_MALE,
+        emotion: AffyEmotion = AffyEmotionEngine.getInstance().currentAffyEmotion.value,
         isActiveSession: () -> Boolean = { true },
         onDone: (() -> Unit)? = null
     ): Boolean = withContext(Dispatchers.IO) {
@@ -59,26 +63,38 @@ class GeminiTtsService(
         }
 
         val startTime = System.currentTimeMillis()
-        val cacheKey = hashText("$cleanText-$voiceName")
+        val profile = AffyEmotionEngine.getInstance().getEmotionalVoiceProfile(emotion, voiceName)
+
+        // Soften punctuation and pauses for melancholic/sad/caring delivery
+        val spokenText = when (emotion) {
+            AffyEmotion.SAD_SOFT, AffyEmotion.CARING_CONCERNED -> cleanText.replace("!", ".").replace("  ", " ")
+            else -> cleanText
+        }
+
+        val cacheKey = hashText("${spokenText}_${voiceName}_${emotion.name}")
         val cachedFile = File(cacheDir, "$cacheKey.wav")
 
         val voiceLabel = if (voiceName.equals(VOICE_LEDA_YOUNG_FEMALE, ignoreCase = true)) "AFFY Female Voice" else "AFFY Male Voice (17yo)"
 
         if (cachedFile.exists() && cachedFile.length() > 100) {
             if (!isActiveSession()) return@withContext false
-            Log.d(TAG, "Playing from TTS audio cache: ${cachedFile.name}")
-            AffyDiagnostics.updateVoiceProvider("GEMINI_TTS ($voiceLabel) [Cached]")
-            val played = playAudioFile(cachedFile, isActiveSession, onDone)
+            Log.d(TAG, "Playing from TTS audio cache: ${cachedFile.name} (Emotion: ${emotion.name})")
+            AffyDiagnostics.updateVoiceProvider("GEMINI_TTS ($voiceLabel) [Cached ${profile.emotionalTag}]")
+            val played = playAudioFile(cachedFile, profile, isActiveSession, onDone)
             return@withContext played
         }
 
         val request = GeminiGenerateRequest(
             contents = listOf(
                 GeminiContent(
-                    parts = listOf(GeminiPart(text = cleanText))
+                    parts = listOf(GeminiPart(text = spokenText))
                 )
             ),
+            systemInstruction = GeminiContent(
+                parts = listOf(GeminiPart(text = "You are synthesizing spoken audio. Voice tone: ${profile.toneInstruction}. Deliver the Urdu/Hindi/English speech with natural emotion, appropriate pacing, breath, and human intonation."))
+            ),
             generationConfig = GeminiGenerationConfig(
+                temperature = 0.5f,
                 responseMimeType = null,
                 responseModalities = listOf("AUDIO"),
                 speechConfig = GeminiSpeechConfig(
@@ -95,7 +111,7 @@ class GeminiTtsService(
         for (modelToUse in ttsModels) {
             if (!isActiveSession()) return@withContext false
             try {
-                Log.d(TAG, "Requesting Gemini TTS audio from model: $modelToUse for: '$cleanText'")
+                Log.d(TAG, "Requesting Gemini TTS audio from model: $modelToUse for: '$spokenText' [Emotion: ${emotion.name}]")
                 val response = withTimeoutOrNull(SYNTHESIS_NETWORK_TIMEOUT_MS) {
                     apiService.generateContent(
                         model = modelToUse,
@@ -134,12 +150,12 @@ class GeminiTtsService(
                     }
 
                     val latency = System.currentTimeMillis() - startTime
-                    Log.i(TAG, "Gemini TTS audio synthesized successfully in ${latency}ms using $modelToUse ($voiceName)")
-                    AffyDiagnostics.updateVoiceProvider("GEMINI_TTS ($voiceLabel)")
+                    Log.i(TAG, "Gemini TTS audio synthesized successfully in ${latency}ms using $modelToUse ($voiceName) [${profile.emotionalTag}]")
+                    AffyDiagnostics.updateVoiceProvider("GEMINI_TTS ($voiceLabel) [${profile.emotionalTag}]")
 
                     if (!isActiveSession()) return@withContext false
 
-                    val played = playAudioFile(cachedFile, isActiveSession, onDone)
+                    val played = playAudioFile(cachedFile, profile, isActiveSession, onDone)
                     return@withContext played
                 } else {
                     val err = response.error?.message ?: "No audio inlineData in candidate"
@@ -155,6 +171,7 @@ class GeminiTtsService(
 
     private suspend fun playAudioFile(
         audioFile: File,
+        profile: EmotionalVoiceProfile,
         isActiveSession: () -> Boolean = { true },
         onDone: (() -> Unit)?
     ): Boolean = withContext(Dispatchers.Main) {
@@ -171,6 +188,19 @@ class GeminiTtsService(
                 setDataSource(audioFile.absolutePath)
                 prepare()
             }
+
+            // Apply dynamic emotional acoustic modulation (pitch + speed + volume)
+            try {
+                val params = player.playbackParams
+                params.pitch = profile.pitchMultiplier
+                params.speed = profile.speedMultiplier
+                player.playbackParams = params
+                Log.d(TAG, "Applied emotional playback params [pitch=${profile.pitchMultiplier}, speed=${profile.speedMultiplier}, tag=${profile.emotionalTag}]")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to apply emotional playbackParams: ${e.message}")
+            }
+            player.setVolume(profile.volumeMultiplier, profile.volumeMultiplier)
+
             mediaPlayer = player
 
             isPlaying = true
