@@ -30,6 +30,17 @@ object DynamicPlanGenerator {
         val clean = prompt.trim()
         val lower = clean.lowercase(Locale.ROOT)
 
+        // Priority 0: Check if AffyFastCommandRouter matches a specialized workflow (ChatGPT image, download, wallpaper)
+        val fastPlan = com.example.agent.AffyFastCommandRouter.tryFastMatch(clean)
+        if (fastPlan != null && (
+                fastPlan.intent == ActionTypes.CHATGPT_GENERATE_IMAGE ||
+                fastPlan.intent == ActionTypes.DOWNLOAD_CHATGPT_IMAGE ||
+                fastPlan.intent == ActionTypes.SET_WALLPAPER
+            )
+        ) {
+            return fromAffyPlan(fastPlan)
+        }
+
         // Split into logical clauses by conjunctions
         val clauses = splitIntoClauses(clean)
         val steps = mutableListOf<AgentTaskStep>()

@@ -168,6 +168,19 @@ class AffyActionExecutor(
             ActionTypes.TAKE_PHOTO -> handleTakePhoto(action.value ?: action.target)
             ActionTypes.FORCE_STOP_APP, ActionTypes.KILL_APP -> handleForceStopApp(action.target ?: action.text ?: "")
             ActionTypes.SELECT_SIM -> handleSelectSim(action.target ?: action.value)
+            ActionTypes.PLAY_STORE_UPDATE -> handlePlayStoreUpdate(
+                targetApp = action.target ?: "WhatsApp",
+                shouldCloseOnComplete = action.value?.contains("close") == true || action.text?.contains("band") == true
+            )
+            ActionTypes.WHATSAPP_STATUS -> handleWhatsAppStatus(
+                subAction = action.value ?: "open",
+                targetContact = action.target
+            )
+            ActionTypes.WHATSAPP_SEND_MEDIA -> handleWhatsAppSendMedia(
+                recipient = action.target ?: "",
+                mediaQuery = action.text
+            )
+            ActionTypes.DOWNLOAD_FILE -> handleDownloadFile()
             else -> ActionResult(true, "Chat or generic action")
         }
 
@@ -534,7 +547,13 @@ class AffyActionExecutor(
                     "${idx + 1}. ${c.displayString}"
                 }.joinToString("\n")
 
-                val speechPrompt = "${result.candidates[0].name} ke ${result.candidates.size} contacts mile hain:\n$formattedList\nKaunsa call karun?"
+                val count = result.candidates.size
+                val isSinglePersonMultipleNumbers = result.candidates.all { it.name.equals(result.candidates[0].name, ignoreCase = true) }
+                val speechPrompt = if (isSinglePersonMultipleNumbers) {
+                    "${result.candidates[0].name} ke $count numbers mile hain:\n$formattedList\nKaunse number pe call karun?"
+                } else {
+                    "$count contacts match hue hain:\n$formattedList\nKaunse contact pe call karun?"
+                }
 
                 AffyConversationContextManager.getInstance().setPendingContactDisambiguation(
                     PendingContactDisambiguation(
@@ -618,7 +637,13 @@ class AffyActionExecutor(
                 val formattedList = result.candidates.mapIndexed { idx, c ->
                     "${idx + 1}. ${c.displayString}"
                 }.joinToString("\n")
-                val prompt = "${result.candidates[0].name} ke ${result.candidates.size} contacts mile hain:\n$formattedList\nKaunse number pe WhatsApp call karun?"
+                val count = result.candidates.size
+                val isSinglePersonMultipleNumbers = result.candidates.all { it.name.equals(result.candidates[0].name, ignoreCase = true) }
+                val prompt = if (isSinglePersonMultipleNumbers) {
+                    "${result.candidates[0].name} ke $count numbers mile hain:\n$formattedList\nKaunse number pe WhatsApp call karun?"
+                } else {
+                    "$count contacts match hue hain:\n$formattedList\nKaunse contact pe WhatsApp call karun?"
+                }
                 ActionResult(false, "Multiple contacts found", speechResponseOverride = prompt)
             }
             is ContactResolutionResult.NotFound -> {
@@ -852,7 +877,13 @@ class AffyActionExecutor(
                     "${idx + 1}. ${c.displayString}"
                 }.joinToString("\n")
 
-                val speechPrompt = "${contactResult.candidates[0].name} ke ${contactResult.candidates.size} contacts mile hain:\n$formattedList\nKaunse number pe WhatsApp message bhejun?"
+                val count = contactResult.candidates.size
+                val isSinglePersonMultipleNumbers = contactResult.candidates.all { it.name.equals(contactResult.candidates[0].name, ignoreCase = true) }
+                val speechPrompt = if (isSinglePersonMultipleNumbers) {
+                    "${contactResult.candidates[0].name} ke $count numbers mile hain:\n$formattedList\nKaunse number pe WhatsApp message bhejun?"
+                } else {
+                    "$count contacts match hue hain:\n$formattedList\nKaunse contact pe WhatsApp message bhejun?"
+                }
 
                 contextManager.setPendingContactDisambiguation(
                     PendingContactDisambiguation(
@@ -2601,6 +2632,222 @@ class AffyActionExecutor(
                 )
             }
         }
+    }
+
+    private suspend fun handlePlayStoreUpdate(targetApp: String, shouldCloseOnComplete: Boolean = false): ActionResult {
+        val a11y = AffyAccessibilityService.instance
+        if (a11y == null) {
+            return ActionResult(false, "Accessibility unavailable", "Play Store update ke liye Accessibility permission enable karein.")
+        }
+
+        val appPackageMap = mapOf(
+            "whatsapp" to "com.whatsapp",
+            "whatsapp business" to "com.whatsapp.w4b",
+            "youtube" to "com.google.android.youtube",
+            "instagram" to "com.instagram.android",
+            "facebook" to "com.facebook.katana",
+            "chrome" to "com.android.chrome"
+        )
+        val cleanName = targetApp.lowercase().trim()
+        val resolvedPkg = appPackageMap[cleanName] ?: appPackageMap.entries.firstOrNull { cleanName.contains(it.key) }?.value
+
+        try {
+            val uri = if (resolvedPkg != null) {
+                Uri.parse("market://details?id=$resolvedPkg")
+            } else {
+                Uri.parse("market://search?q=${Uri.encode(targetApp)}")
+            }
+            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                setPackage("com.android.vending")
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(intent)
+
+            delay(1500)
+
+            val buttonState = a11y.getPlayStoreButtonState()
+            Log.i("AffyActionExecutor", "[PLAY_STORE_UPDATE] Initial button state for $targetApp: $buttonState")
+
+            if (buttonState == AffyAccessibilityService.PlayStoreButtonState.OPEN) {
+                return ActionResult(
+                    isSuccess = true,
+                    summary = "$targetApp is already up to date",
+                    speechResponseOverride = "Boss, $targetApp pehle se hi updated hai."
+                )
+            }
+
+            if (buttonState == AffyAccessibilityService.PlayStoreButtonState.UPDATE ||
+                buttonState == AffyAccessibilityService.PlayStoreButtonState.INSTALL) {
+                val clicked = a11y.clickPlayStoreActionButton()
+                if (!clicked) {
+                    return ActionResult(
+                        isSuccess = false,
+                        summary = "Failed to click Update button",
+                        speechResponseOverride = "Play Store par update button press nahi ho saka."
+                    )
+                }
+
+                // Polling wait for installation/update to finish (up to 40 seconds)
+                val maxWaitMs = 40_000L
+                val pollInterval = 2_000L
+                var elapsed = 0L
+                var isCompleted = false
+
+                while (elapsed < maxWaitMs) {
+                    delay(pollInterval)
+                    elapsed += pollInterval
+                    val currentState = a11y.getPlayStoreButtonState()
+                    Log.d("AffyActionExecutor", "[PLAY_STORE_WAIT] Elapsed ${elapsed}ms, state: $currentState")
+                    if (currentState == AffyAccessibilityService.PlayStoreButtonState.OPEN) {
+                        isCompleted = true
+                        break
+                    }
+                }
+
+                if (isCompleted) {
+                    if (shouldCloseOnComplete) {
+                        delay(600)
+                        a11y.performGlobal(AccessibilityService.GLOBAL_ACTION_BACK)
+                        delay(400)
+                        a11y.performGlobal(AccessibilityService.GLOBAL_ACTION_HOME)
+                        return ActionResult(
+                            isSuccess = true,
+                            summary = "$targetApp updated and Play Store closed",
+                            speechResponseOverride = "Boss, $targetApp successfully update ho gaya hai aur Play Store band kar diya hai."
+                        )
+                    } else {
+                        return ActionResult(
+                            isSuccess = true,
+                            summary = "$targetApp updated successfully",
+                            speechResponseOverride = "Boss, $targetApp successfully update ho gaya hai."
+                        )
+                    }
+                } else {
+                    return ActionResult(
+                        isSuccess = true,
+                        summary = "$targetApp update initiated and downloading",
+                        speechResponseOverride = "Boss, $targetApp ka update start ho gaya hai aur background mein download ho raha hai."
+                    )
+                }
+            } else if (buttonState == AffyAccessibilityService.PlayStoreButtonState.PENDING_OR_DOWNLOADING) {
+                return ActionResult(
+                    isSuccess = true,
+                    summary = "$targetApp update is already downloading",
+                    speechResponseOverride = "Boss, $targetApp ka update pehle se download/install ho raha hai."
+                )
+            } else {
+                return ActionResult(
+                    isSuccess = false,
+                    summary = "Play Store page for $targetApp not resolved",
+                    speechResponseOverride = "Play Store par $targetApp ka update button verify nahi ho saka."
+                )
+            }
+        } catch (e: Exception) {
+            return ActionResult(
+                isSuccess = false,
+                summary = "Play Store error: ${e.message}",
+                speechResponseOverride = "Play Store open karne mein masla hua: ${e.message}"
+            )
+        }
+    }
+
+    private suspend fun handleWhatsAppStatus(subAction: String, targetContact: String?): ActionResult {
+        val a11y = AffyAccessibilityService.instance
+        if (a11y == null) {
+            return ActionResult(false, "Accessibility inactive", "WhatsApp status ke liye Accessibility enable karein.")
+        }
+
+        if (subAction.equals("next", ignoreCase = true)) {
+            val tapped = a11y.nextWhatsAppStatus()
+            return if (tapped) {
+                ActionResult(true, "Next status played", "Agla status play kar diya.")
+            } else {
+                ActionResult(false, "Next status failed", "Agla status play nahi ho saka.")
+            }
+        }
+
+        val pkg = WhatsAppInstanceManager.resolveOutgoingInstance(context) ?: WhatsAppInstanceManager.PKG_WHATSAPP
+        val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
+        if (launchIntent != null) {
+            context.startActivity(launchIntent)
+            delay(1200)
+            val opened = a11y.openWhatsAppStatus(targetContact)
+            return if (opened) {
+                val speech = if (!targetContact.isNullOrBlank()) "$targetContact ka status khol diya hai." else "WhatsApp status open kar diya hai."
+                ActionResult(true, "Status opened", speech)
+            } else {
+                ActionResult(false, "Status not found", "WhatsApp updates/status screen par status nahi mila.")
+            }
+        } else {
+            return ActionResult(false, "WhatsApp not installed", "WhatsApp install nahi hai.")
+        }
+    }
+
+    private suspend fun handleWhatsAppSendMedia(recipient: String, mediaQuery: String?): ActionResult {
+        val a11y = AffyAccessibilityService.instance
+        if (a11y == null) {
+            return ActionResult(false, "Accessibility inactive", "Picture send karne ke liye Accessibility enable karein.")
+        }
+
+        val targetName = if (recipient.isNotBlank()) recipient else "current_chat"
+        val isCurrentChat = targetName.contains("current") || targetName.contains("is chat") || targetName.contains("ye chat")
+
+        if (!isCurrentChat) {
+            val contactRes = contactResolver.resolveContact(targetName)
+            when (contactRes) {
+                is ContactResolutionResult.NotFound -> {
+                    return ActionResult(false, "Contact not found", "Hmm, $targetName naam ka contact nahi mila.")
+                }
+                is ContactResolutionResult.PermissionMissing -> {
+                    return ActionResult(false, "Permission missing", "Contacts permission allow karein.")
+                }
+                is ContactResolutionResult.Multiple -> {
+                    val formatted = contactRes.candidates.mapIndexed { i, c -> "${i + 1}. ${c.displayString}" }.joinToString("\n")
+                    return ActionResult(false, "Multiple contacts", "${contactRes.candidates[0].name} ke ${contactRes.candidates.size} contacts mile:\n$formatted\nKaunse contact ko picture bhejun?")
+                }
+                is ContactResolutionResult.Single -> {
+                    val phone = contactRes.phoneNumber.replace(Regex("[^0-9]"), "")
+                    val targetPkg = WhatsAppInstanceManager.resolveOutgoingInstance(context) ?: WhatsAppInstanceManager.PKG_WHATSAPP
+                    val uri = Uri.parse("https://api.whatsapp.com/send?phone=$phone")
+                    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                        setPackage(targetPkg)
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                    delay(1400)
+                }
+            }
+        }
+
+        val header = a11y.extractActiveWhatsAppChatTitle()
+        Log.i("AffyActionExecutor", "[WA_SEND_MEDIA] Active chat header: $header")
+
+        val openedPicker = a11y.openWhatsAppAttachmentPicker()
+        if (!openedPicker) {
+            return ActionResult(false, "Attachment picker not found", "Screen par attachment icon nahi mila.")
+        }
+
+        val selectedPhoto = a11y.selectFirstGalleryImage()
+        if (!selectedPhoto) {
+            return ActionResult(false, "Gallery image not found", "Gallery se image select nahi ho saki.")
+        }
+
+        delay(600)
+        val sent = a11y.clickWhatsAppSendMediaButton()
+        return if (sent) {
+            val toWhom = header ?: recipient
+            ActionResult(true, "Image sent to $toWhom", "$toWhom ko picture send kar di hai.")
+        } else {
+            ActionResult(false, "Send button failed", "Picture send button press nahi hua.")
+        }
+    }
+
+    private fun handleDownloadFile(): ActionResult {
+        val a11y = AffyAccessibilityService.instance
+        if (a11y != null && a11y.clickPageDownloadButton()) {
+            return ActionResult(true, "Download button clicked", "Page par download button dhoond kar click kar diya hai.")
+        }
+        return ActionResult(false, "Download button not found", "Screen par koi direct download button nahi mila.")
     }
 }
 

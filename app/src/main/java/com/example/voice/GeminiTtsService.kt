@@ -50,6 +50,7 @@ class GeminiTtsService(
         text: String,
         apiKey: String,
         voiceName: String = VOICE_PUCK_YOUNG_MALE,
+        emotionTone: String? = null,
         isActiveSession: () -> Boolean = { true },
         onDone: (() -> Unit)? = null
     ): Boolean = withContext(Dispatchers.IO) {
@@ -59,7 +60,12 @@ class GeminiTtsService(
         }
 
         val startTime = System.currentTimeMillis()
-        val cacheKey = hashText("$cleanText-$voiceName")
+        val speechPrompt = if (!emotionTone.isNullOrBlank()) {
+            "($emotionTone) $cleanText"
+        } else {
+            cleanText
+        }
+        val cacheKey = hashText("$speechPrompt-$voiceName")
         val cachedFile = File(cacheDir, "$cacheKey.wav")
 
         val voiceLabel = if (voiceName.equals(VOICE_LEDA_YOUNG_FEMALE, ignoreCase = true)) "AFFY Female Voice" else "AFFY Male Voice (17yo)"
@@ -75,7 +81,7 @@ class GeminiTtsService(
         val request = GeminiGenerateRequest(
             contents = listOf(
                 GeminiContent(
-                    parts = listOf(GeminiPart(text = cleanText))
+                    parts = listOf(GeminiPart(text = speechPrompt))
                 )
             ),
             generationConfig = GeminiGenerationConfig(

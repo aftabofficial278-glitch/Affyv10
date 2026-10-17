@@ -453,11 +453,60 @@ object AffyFastCommandRouter {
             )
         }
 
-        // 8.00 Visible Chat List & Contacts Reader ("Samne kaun kaun se chats/contacts hain?", "chats dikhao", "chat list batao")
+        // 8.001 Open Specific Contact Chat ("Ali ki chat open karo", "Ali ki chat kholo", "Elon ki chat open krna")
+        val cleanForChat = normalized.replace(Regex("(?i)^(?:affy|hey affy|suno affy)\\s*"), "").trim()
+        val openChatRegex = Regex("(?i)(?:screen\\s+par\\s+)?([a-zA-Z0-9\\u0600-\\u06FF\\s]+?)\\s*(?:ki|ke)?\\s*(?:chat|conversation)\\s*(?:ko\\s+)?(?:open\\s*karo|open\\s*krna|open\\s*kr|open\\s*kro|open\\s*kar\\s*do|kholo|khol\\s*do|kholna)")
+        val openChatMatch = openChatRegex.find(cleanForChat)
+        if (openChatMatch != null) {
+            val contactRaw = openChatMatch.groupValues[1].trim()
+            val cleanedContact = ContactResolver.cleanContactQuery(contactRaw).ifBlank { contactRaw }
+            val lowerCand = cleanedContact.lowercase()
+            if (cleanedContact.isNotBlank() && !listOf("is", "ye", "current", "this", "pehli", "doosri", "teesri", "dusri", "tisri", "aakhri", "last").contains(lowerCand)) {
+                return AffyPlan(
+                    intent = ActionTypes.OPEN_CHAT,
+                    speechResponse = "$cleanedContact ki chat open kar raha hoon.",
+                    actions = listOf(
+                        AffyActionItem(
+                            type = ActionTypes.OPEN_CHAT,
+                            target = cleanedContact
+                        )
+                    )
+                )
+            }
+        }
+
+        val openChatDirectRegex = Regex("(?i)(?:chat\\s*(?:open\\s*karo|open\\s*krna|open\\s*kr|open\\s*kro|open\\s*kar\\s*do|kholo|khol\\s*do)|open\\s*chat)\\s+([a-zA-Z0-9\\u0600-\\u06FF\\s]+)")
+        val openDirectMatch = openChatDirectRegex.find(cleanForChat)
+        if (openDirectMatch != null) {
+            val contactRaw = openDirectMatch.groupValues[1].trim()
+            val cleanedContact = ContactResolver.cleanContactQuery(contactRaw).ifBlank { contactRaw }
+            val lowerCand = cleanedContact.lowercase()
+            if (cleanedContact.isNotBlank() && !listOf("is", "ye", "current", "this", "pehli", "doosri", "teesri", "dusri", "tisri", "aakhri", "last").contains(lowerCand)) {
+                return AffyPlan(
+                    intent = ActionTypes.OPEN_CHAT,
+                    speechResponse = "$cleanedContact ki chat open kar raha hoon.",
+                    actions = listOf(
+                        AffyActionItem(
+                            type = ActionTypes.OPEN_CHAT,
+                            target = cleanedContact
+                        )
+                    )
+                )
+            }
+        }
+
+        // 8.00 Visible Chat List & Contacts Reader ("Samne kaun kaun se chats/contacts hain?", "chats dikhao", "chat list batao", "screen per kitne contact ha unke name")
         if (lower.contains("samne kaun kaun se chat") || lower.contains("samne kaun se chat") ||
             lower.contains("samne kaun si chat") || lower.contains("samne kaun kaun si chat") ||
             lower.contains("samne kaun kaun se contact") || lower.contains("samne kaun se contact") ||
             lower.contains("kaun kaun se contact") || lower.contains("kaun se contact") ||
+            lower.contains("kitne contact") || lower.contains("kitne contacts") ||
+            lower.contains("kitni chat") || lower.contains("kitne chat") ||
+            lower.contains("contacts ke naam") || lower.contains("contact ke naam") ||
+            lower.contains("contacts ke name") || lower.contains("contact ke name") ||
+            (lower.contains("screen") && (lower.contains("contact") || lower.contains("contacts") || lower.contains("chats"))) ||
+            lower.contains("whatsapp me kitne") || lower.contains("whatsapp par kitne") ||
+            lower.contains("whatsapp ke contact") || lower.contains("whatsapp contacts") ||
             lower.contains("visible chat") || lower.contains("chat list") || lower.contains("chats ke naam") ||
             lower.contains("chats batao") || lower.contains("contacts batao") || lower.contains("chats dikhao")
         ) {
@@ -472,7 +521,7 @@ object AffyFastCommandRouter {
             )
         }
 
-        // 8.0 Open Chat Message Reader ("jo chat screen par open hai uske messages padho", "is chat ke messages suna do", "is chat mein kya message aya hai")
+        // 8.0 Open Chat Message Reader ("jo chat screen par open hai uske messages padho", "is chat ke messages suna do", "is chat mein kya message aya hai", "unke msg read krna")
         if (lower.contains("chat screen par open") || lower.contains("chat open hai") || lower.contains("is chat ke messages") ||
             lower.contains("ye chat ke messages") || lower.contains("jo samne chat") || lower.contains("is chat ko padho") ||
             lower.contains("is chat ko parho") || lower.contains("ye chat parho") || lower.contains("ye chat padho") ||
@@ -483,7 +532,11 @@ object AffyFastCommandRouter {
             lower.contains("is chat mein kya message") || lower.contains("is chat me kya message") ||
             lower.contains("kya message aya hai") || lower.contains("kya message hai") ||
             lower.contains("message kya aya") || lower.contains("is chat mein kya likha") ||
-            lower.contains("is chat me kya likha") || lower.contains("chat mein kya aya")
+            lower.contains("is chat me kya likha") || lower.contains("chat mein kya aya") ||
+            lower.contains("msg read") || lower.contains("msg parh") || lower.contains("msg padh") ||
+            lower.contains("message read") || lower.contains("message padh") || lower.contains("message parh") ||
+            lower.contains("chat ke msg") || lower.contains("chat ke message") ||
+            lower.contains("unke msg") || lower.contains("unke message") || lower.contains("unke messages")
         ) {
             return AffyPlan(
                 intent = ActionTypes.READ_SCREEN_MESSAGES,

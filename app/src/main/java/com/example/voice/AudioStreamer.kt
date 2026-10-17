@@ -33,8 +33,10 @@ class AudioStreamer(
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val CHUNK_SIZE_SAMPLES = 512 // 32ms chunk @ 16kHz
         private const val CHUNK_SIZE_BYTES = CHUNK_SIZE_SAMPLES * 2 // 16-bit PCM = 2 bytes per sample
-        private const val VOICE_THRESHOLD_RMS = 2600.0 // Calibrated threshold for genuine direct user speech (filters out fan, TV, room noise)
-        private const val SUSTAINED_VOICE_FRAMES_REQUIRED = 6 // ~192ms of consecutive speech frames required to trigger barge-in
+        private const val VOICE_THRESHOLD_IDLE_RMS = 2600.0 // Calibrated threshold for genuine direct user speech (filters out fan, TV, room noise)
+        private const val VOICE_THRESHOLD_SPEAKING_RMS = 5200.0 // Dynamic elevated threshold during AFFY speaker playback (filters out speaker echo)
+        private const val SUSTAINED_VOICE_FRAMES_IDLE = 6 // ~192ms of consecutive speech frames required when idle
+        private const val SUSTAINED_VOICE_FRAMES_SPEAKING = 7 // ~224ms of consecutive speech frames required during playback to trigger barge-in
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -46,6 +48,17 @@ class AudioStreamer(
 
     @Volatile
     private var isStreaming = false
+
+    @Volatile
+    private var isSpeakerActive = false
+
+    fun setSpeakerActive(active: Boolean) {
+        if (isSpeakerActive != active) {
+            isSpeakerActive = active
+            consecutiveVoiceFrames = 0
+            Log.d(TAG, "[DYNAMIC_VAD] isSpeakerActive=$active threshold=${if (active) VOICE_THRESHOLD_SPEAKING_RMS else VOICE_THRESHOLD_IDLE_RMS}")
+        }
+    }
 
     fun isRecording(): Boolean = isStreaming
 
@@ -154,12 +167,13 @@ class AudioStreamer(
                                 onAmplitudeChanged(normalizedAmp)
                             }
 
-                            // Robust Barge-In: Require sustained direct human speech above noise threshold (~192ms)
-                            // Prevents TV, fan, nearby chatter, or transient clicks from interrupting AFFY
+                            // Dynamic Barge-In: Elevated 5200.0 RMS and 7 frames when AFFY speaks, standard 2600.0 RMS when idle
+                            val threshold = if (isSpeakerActive) VOICE_THRESHOLD_SPEAKING_RMS else VOICE_THRESHOLD_IDLE_RMS
+                            val requiredFrames = if (isSpeakerActive) SUSTAINED_VOICE_FRAMES_SPEAKING else SUSTAINED_VOICE_FRAMES_IDLE
                             val now = System.currentTimeMillis()
-                            if (rms >= VOICE_THRESHOLD_RMS) {
+                            if (rms >= threshold) {
                                 consecutiveVoiceFrames++
-                                if (consecutiveVoiceFrames >= SUSTAINED_VOICE_FRAMES_REQUIRED &&
+                                if (consecutiveVoiceFrames >= requiredFrames &&
                                     (now - lastVoiceTriggerTime > 1200L) &&
                                     (now - streamStartTime > 400L)
                                 ) {

@@ -352,6 +352,7 @@ class AffyAgentCoordinator(
                 when (liveState) {
                     com.example.voice.LiveSessionState.STREAMING_AUDIO -> {
                         thinkingWatchdogJob?.cancel()
+                        textToSpeech?.stop()
                         _uiState.update { it.copy(state = AffyState.SPEAKING, errorMessage = null) }
                     }
                     com.example.voice.LiveSessionState.EXECUTING_TOOL -> {
@@ -421,6 +422,10 @@ class AffyAgentCoordinator(
                 }
             }
         )
+
+        audioStreamer?.isPlaybackActive = {
+            geminiLiveSession?.isAudioPlayingOut() == true || textToSpeech?.engineState?.value == com.example.voice.TtsEngineState.SPEAKING
+        }
 
         speechRecognizer = AffySpeechRecognizer(
             context = context,
@@ -1165,6 +1170,7 @@ class AffyAgentCoordinator(
 
             withContext(Dispatchers.Main) {
                 if (currentExecutionToken != token) return@withContext
+                geminiLiveSession?.interruptPlayback()
                 textToSpeech?.speak(finalReply) {
                     if (currentExecutionToken != token) return@speak
                     startContinuousListeningWindow()
@@ -1631,6 +1637,7 @@ class AffyAgentCoordinator(
             // Voice output
             withContext(Dispatchers.Main) {
                 if (currentExecutionToken != token) return@withContext
+                geminiLiveSession?.interruptPlayback()
                 textToSpeech?.speak(finalSpeech) {
                     if (currentExecutionToken != token) return@speak
                     if (plan.intent == ActionTypes.STOP_CANCEL || plan.intent == ActionTypes.DEACTIVATE_OVERLAY) {
@@ -2054,25 +2061,13 @@ class AffyAgentCoordinator(
         return try {
             when (name) {
                 "sendWhatsAppMessage" -> {
-                    val rawRecipient = args["recipient"]?.toString()
-                        ?: args["contact"]?.toString()
-                        ?: args["name"]?.toString()
-                        ?: ""
-                    val message = args["message"]?.toString()
-                        ?: args["text"]?.toString()
-                        ?: ""
+                    val rawRecipient = args["recipient"]?.toString() ?: ""
+                    val message = args["message"]?.toString() ?: ""
                     val cleanRec = rawRecipient.trim().lowercase()
-                    val isPronoun = cleanRec.isBlank() || cleanRec in listOf(
-                        "iski", "iska", "uska", "unka", "isko", "use", "usko", "inhe", "unhe", "unhein",
-                        "is", "us", "this", "him", "her", "them", "sender", "notification", "reply"
-                    )
+                    val isPronoun = cleanRec in listOf("iski", "iska", "uska", "unka", "isko", "inhe", "unhe", "is", "us", "this", "him", "her", "them")
                     val recipient = if (isPronoun) {
-                        notificationAssistant.resolveContextualSender(cleanRec)?.sender
-                            ?: AffyConversationContextManager.getInstance().resolveContextualRecipient(cleanRec)
-                            ?: rawRecipient
+                        notificationAssistant.resolveContextualSender(cleanRec)?.sender ?: rawRecipient
                     } else {
-                        AffyConversationContextManager.getInstance().invalidateStaleNotificationIfTargetChanged(rawRecipient)
-                        notificationAssistant.invalidateStaleTargetIfChanged(rawRecipient)
                         rawRecipient
                     }
                     val result = actionExecutor.executeAction(
@@ -2082,11 +2077,7 @@ class AffyAgentCoordinator(
                             text = message
                         )
                     )
-                    if (result.isSuccess) {
-                        result.speechResponseOverride ?: result.summary
-                    } else {
-                        result.speechResponseOverride ?: "Failed: ${result.summary}"
-                    }
+                    if (result.isSuccess) result.summary else "Failed: ${result.summary}"
                 }
                 "makePhoneCall" -> {
                     val contact = args["contactNameOrNumber"]?.toString()
@@ -2166,13 +2157,8 @@ class AffyAgentCoordinator(
                     result.summary
                 }
                 "replyToNotification" -> {
-                    val sender = args["sender"]?.toString()
-                        ?: args["recipient"]?.toString()
-                        ?: args["contact"]?.toString()
-                        ?: ""
-                    val message = args["message"]?.toString()
-                        ?: args["text"]?.toString()
-                        ?: ""
+                    val sender = args["sender"]?.toString() ?: ""
+                    val message = args["message"]?.toString() ?: ""
                     val (success, summary) = notificationAssistant.executeDirectReply(sender, message)
                     if (success) summary else "Failed: $summary"
                 }

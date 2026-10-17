@@ -2371,4 +2371,273 @@ class AffyAccessibilityService : AccessibilityService() {
 
         return if (node.isSelected) true else null
     }
+
+    enum class WhatsAppScreenType {
+        CHAT_LIST,
+        CONVERSATION,
+        STATUS_UPDATES,
+        MEDIA_PICKER,
+        SEARCH,
+        OTHER
+    }
+
+    data class WhatsAppConversationDetails(
+        val screenType: WhatsAppScreenType,
+        val headerTitle: String?,
+        val isGroup: Boolean,
+        val latestIncomingMessage: String?,
+        val latestSentMessage: String?
+    )
+
+    enum class PlayStoreButtonState {
+        UPDATE,
+        OPEN,
+        INSTALL,
+        PENDING_OR_DOWNLOADING,
+        UNKNOWN
+    }
+
+    fun getWhatsAppConversationDetails(): WhatsAppConversationDetails {
+        val root = getFreshActiveWindowRoot() ?: return WhatsAppConversationDetails(
+            screenType = WhatsAppScreenType.OTHER,
+            headerTitle = null,
+            isGroup = false,
+            latestIncomingMessage = null,
+            latestSentMessage = null
+        )
+
+        var detectedType = WhatsAppScreenType.OTHER
+        var headerTitle: String? = null
+        var isGroup = false
+        var incomingMsg: String? = null
+        var sentMsg: String? = null
+
+        val displayMetrics = resources.displayMetrics
+        val screenWidth = displayMetrics.widthPixels
+
+        fun traverse(node: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 24) return
+            val id = node.viewIdResourceName?.lowercase() ?: ""
+            val text = node.text?.toString()?.trim() ?: ""
+            val desc = node.contentDescription?.toString()?.trim() ?: ""
+
+            // Status / Updates tab
+            if ((text.equals("Updates", ignoreCase = true) || text.equals("Status", ignoreCase = true) ||
+                desc.contains("Updates tab", ignoreCase = true) || desc.contains("Status tab", ignoreCase = true)) && node.isSelected) {
+                detectedType = WhatsAppScreenType.STATUS_UPDATES
+            }
+
+            // Media picker
+            if (id.contains("gallery") || id.contains("media_picker") || text.equals("Gallery", ignoreCase = true) ||
+                text.equals("Send to…", ignoreCase = true) || text.equals("Send to...", ignoreCase = true) ||
+                desc.contains("Selected photo", ignoreCase = true)) {
+                detectedType = WhatsAppScreenType.MEDIA_PICKER
+            }
+
+            // Group subtitle detection
+            if (text.contains("tap here for group info", ignoreCase = true) || text.contains("members", ignoreCase = true) ||
+                (text.contains(",") && depth < 8)) {
+                isGroup = true
+            }
+
+            // Message text inspection
+            if (id.contains("message_text") || id.contains("msg_text")) {
+                if (text.isNotBlank()) {
+                    val rect = Rect()
+                    node.getBoundsInScreen(rect)
+                    // Messages aligned to the right (rect.left > screenWidth / 3) are typically user's sent messages
+                    if (rect.left > (screenWidth * 0.28f)) {
+                        sentMsg = text
+                    } else {
+                        incomingMsg = text
+                    }
+                }
+            }
+
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                traverse(child, depth + 1)
+            }
+        }
+
+        traverse(root, 0)
+
+        headerTitle = extractActiveWhatsAppChatTitle(root)
+        if (headerTitle != null && detectedType == WhatsAppScreenType.OTHER) {
+            detectedType = WhatsAppScreenType.CONVERSATION
+        } else if (detectedType == WhatsAppScreenType.OTHER) {
+            // Check if chat list
+            if (findNodeUniversal("Chats", root) != null || findNodeUniversal("Archived", root) != null) {
+                detectedType = WhatsAppScreenType.CHAT_LIST
+            }
+        }
+
+        return WhatsAppConversationDetails(
+            screenType = detectedType,
+            headerTitle = headerTitle,
+            isGroup = isGroup,
+            latestIncomingMessage = incomingMsg,
+            latestSentMessage = sentMsg
+        )
+    }
+
+    fun openWhatsAppStatus(targetContact: String? = null): Boolean {
+        val root = getFreshActiveWindowRoot() ?: return false
+        val updatesTab = findNodeUniversal("Updates", root) ?: findNodeUniversal("Status", root)
+        if (updatesTab != null) {
+            tryClickNode(updatesTab)
+            Thread.sleep(600)
+        }
+
+        val freshRoot = getFreshActiveWindowRoot() ?: return false
+        if (!targetContact.isNullOrBlank()) {
+            val contactStatus = findNodeUniversal(targetContact, freshRoot)
+            if (contactStatus != null) {
+                return tryClickNode(contactStatus)
+            }
+        }
+
+        // Click first available status item
+        val statusThumb = findNodeUniversal("status", freshRoot)
+            ?: findNodeUniversal("Recent updates", freshRoot)
+            ?: findNodeUniversal("My status", freshRoot)
+
+        return if (statusThumb != null) tryClickNode(statusThumb) else false
+    }
+
+    fun nextWhatsAppStatus(): Boolean {
+        val metrics = resources.displayMetrics
+        val targetX = metrics.widthPixels * 0.85f
+        val targetY = metrics.heightPixels * 0.50f
+        return performClickGesture(targetX, targetY, 50)
+    }
+
+    fun openWhatsAppAttachmentPicker(): Boolean {
+        val root = getFreshActiveWindowRoot() ?: return false
+        fun findAttachBtn(node: AccessibilityNodeInfo, depth: Int): AccessibilityNodeInfo? {
+            if (depth > 20) return null
+            val id = node.viewIdResourceName?.lowercase() ?: ""
+            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+            if (id.contains("attach") || desc.contains("attach") || desc.contains("attachment") || desc.contains("paperclip")) {
+                return node
+            }
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                val res = findAttachBtn(child, depth + 1)
+                if (res != null) return res
+            }
+            return null
+        }
+
+        val attachBtn = findAttachBtn(root, 0)
+        return if (attachBtn != null) tryClickNode(attachBtn) else false
+    }
+
+    fun selectFirstGalleryImage(): Boolean {
+        Thread.sleep(500)
+        val root = getFreshActiveWindowRoot() ?: return false
+        val galleryBtn = findNodeUniversal("Gallery", root) ?: findNodeUniversal("Photos", root)
+        if (galleryBtn != null) {
+            tryClickNode(galleryBtn)
+            Thread.sleep(600)
+        }
+
+        val freshRoot = getFreshActiveWindowRoot() ?: return false
+        fun findFirstPhoto(node: AccessibilityNodeInfo, depth: Int): AccessibilityNodeInfo? {
+            if (depth > 20) return null
+            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+            val id = node.viewIdResourceName?.lowercase() ?: ""
+            if (desc.contains("photo") || desc.contains("image") || id.contains("thumb") || id.contains("picture")) {
+                if (node.isClickable) return node
+            }
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                val res = findFirstPhoto(child, depth + 1)
+                if (res != null) return res
+            }
+            return null
+        }
+
+        val photoNode = findFirstPhoto(freshRoot, 0)
+        return if (photoNode != null) tryClickNode(photoNode) else false
+    }
+
+    fun clickWhatsAppSendMediaButton(): Boolean {
+        Thread.sleep(600)
+        val root = getFreshActiveWindowRoot() ?: return false
+        fun findSendFab(node: AccessibilityNodeInfo, depth: Int): AccessibilityNodeInfo? {
+            if (depth > 20) return null
+            val id = node.viewIdResourceName?.lowercase() ?: ""
+            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+            if (id.contains("send") || desc == "send" || desc.contains("send button")) {
+                if (node.isClickable) return node
+            }
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                val res = findSendFab(child, depth + 1)
+                if (res != null) return res
+            }
+            return null
+        }
+
+        val sendNode = findSendFab(root, 0) ?: findNodeUniversal("Send", root)
+        return if (sendNode != null) tryClickNode(sendNode) else false
+    }
+
+    fun getPlayStoreButtonState(): PlayStoreButtonState {
+        val root = getFreshActiveWindowRoot() ?: return PlayStoreButtonState.UNKNOWN
+
+        var result = PlayStoreButtonState.UNKNOWN
+        fun scan(node: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 22 || result != PlayStoreButtonState.UNKNOWN) return
+            val text = node.text?.toString()?.trim() ?: ""
+            val desc = node.contentDescription?.toString()?.trim() ?: ""
+
+            if (text.equals("Update", ignoreCase = true) || desc.equals("Update", ignoreCase = true)) {
+                result = PlayStoreButtonState.UPDATE
+                return
+            }
+            if (text.equals("Open", ignoreCase = true) || desc.equals("Open", ignoreCase = true)) {
+                result = PlayStoreButtonState.OPEN
+                return
+            }
+            if (text.equals("Install", ignoreCase = true) || desc.equals("Install", ignoreCase = true)) {
+                result = PlayStoreButtonState.INSTALL
+                return
+            }
+            if (text.equals("Cancel", ignoreCase = true) || desc.contains("Cancel download", ignoreCase = true) ||
+                text.contains("%") || text.contains("Installing", ignoreCase = true) || text.contains("Pending", ignoreCase = true)) {
+                result = PlayStoreButtonState.PENDING_OR_DOWNLOADING
+                return
+            }
+
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                scan(child, depth + 1)
+            }
+        }
+
+        scan(root, 0)
+        return result
+    }
+
+    fun clickPlayStoreActionButton(): Boolean {
+        val root = getFreshActiveWindowRoot() ?: return false
+        val updateBtn = findNodeUniversal("Update", root)
+            ?: findNodeUniversal("Install", root)
+            ?: findNodeUniversal("Open", root)
+        return if (updateBtn != null) tryClickNode(updateBtn) else false
+    }
+
+    fun clickPageDownloadButton(): Boolean {
+        val root = getFreshActiveWindowRoot() ?: return false
+        val downloadAliases = listOf("Download", "Download file", "Direct download", "Download now", "Get file")
+        for (alias in downloadAliases) {
+            val node = findNodeUniversal(alias, root)
+            if (node != null) {
+                return tryClickNode(node)
+            }
+        }
+        return false
+    }
 }

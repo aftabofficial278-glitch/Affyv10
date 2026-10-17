@@ -94,7 +94,7 @@ class AffyTextToSpeech(
         preferredLanguage = language
     }
 
-    fun speak(text: String, onDone: (() -> Unit)? = null) {
+    fun speak(text: String, emotionTone: String? = null, onDone: (() -> Unit)? = null) {
         val cleanText = text.trim()
         if (cleanText.isBlank()) {
             onDone?.invoke()
@@ -109,7 +109,7 @@ class AffyTextToSpeech(
         AffyDiagnostics.logVoiceStage(
             stage = "PRIMARY_REQUEST_START",
             engine = "GEMINI_TTS ($voiceLabel)",
-            details = cleanText
+            details = if (!emotionTone.isNullOrBlank()) "[$emotionTone] $cleanText" else cleanText
         )
 
         scope.launch {
@@ -120,6 +120,7 @@ class AffyTextToSpeech(
                 text = cleanText,
                 apiKey = effectiveKey,
                 voiceName = selectedVoiceName,
+                emotionTone = emotionTone,
                 isActiveSession = { sessionId == activeSessionId },
                 onDone = {
                     if (sessionId == activeSessionId) {

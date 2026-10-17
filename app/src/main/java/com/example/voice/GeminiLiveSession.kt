@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -30,6 +31,7 @@ import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 
@@ -102,6 +104,13 @@ class GeminiLiveSession(
     @Volatile
     private var isTurnGenerationComplete = false
     private var playbackJob: Job? = null
+
+    // Strict FIFO processing for incoming WebSocket frames
+    private val fifoExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "LiveMsgFIFO") }
+    private val fifoDispatcher = fifoExecutor.asCoroutineDispatcher()
+
+    @Volatile
+    private var playbackEpoch: Long = 0L
 
     init {
         initAudioTrack()
@@ -353,7 +362,7 @@ class GeminiLiveSession(
                 val threadName = Thread.currentThread().name
                 val elapsedMs = if (setupSentTimestamp > 0L) System.currentTimeMillis() - setupSentTimestamp else -1L
                 Log.d(TAG, "[LIVE_WS_MESSAGE_RECEIVED] sessionId=$currentId thread=$threadName elapsedMs=$elapsedMs")
-                scope.launch(Dispatchers.Default) {
+                scope.launch(fifoDispatcher) {
                     handleIncomingMessage(text, currentId)
                 }
             }
@@ -367,7 +376,7 @@ class GeminiLiveSession(
                 val elapsedMs = if (setupSentTimestamp > 0L) System.currentTimeMillis() - setupSentTimestamp else -1L
                 Log.d(TAG, "[LIVE_WS_MESSAGE_RECEIVED] sessionId=$currentId thread=$threadName elapsedMs=$elapsedMs")
                 val text = bytes.utf8()
-                scope.launch(Dispatchers.Default) {
+                scope.launch(fifoDispatcher) {
                     handleIncomingMessage(text, currentId)
                 }
             }
@@ -1094,10 +1103,13 @@ class GeminiLiveSession(
                                 val inlineData = part.getJSONObject("inlineData")
                                 val base64Data = inlineData.optString("data")
                                 if (base64Data.isNotBlank()) {
+                                    val currentEpoch = playbackEpoch
                                     val pcmBytes = Base64.decode(base64Data, Base64.DEFAULT)
-                                    Log.d(TAG, "[6] RESPONSE TEXT/AUDIO RECEIVED - Audio chunk ${pcmBytes.size} bytes")
-                                    audioQueue.offer(pcmBytes)
-                                    setInternalState(LiveSessionState.STREAMING_AUDIO)
+                                    Log.d(TAG, "[6] RESPONSE TEXT/AUDIO RECEIVED - Audio chunk ${pcmBytes.size} bytes (epoch=$currentEpoch)")
+                                    if (currentEpoch == playbackEpoch) {
+                                        audioQueue.offer(pcmBytes)
+                                        setInternalState(LiveSessionState.STREAMING_AUDIO)
+                                    }
                                 }
                             }
 
@@ -1184,7 +1196,7 @@ class GeminiLiveSession(
         }
     }
 
-    fun sendUserSpeech(text: String): Boolean {
+    fun sendUserSpeech(text: String, emotionTone: String? = null): Boolean {
         val ws = webSocket
         val clean = text.trim()
         if (ws == null || !isSessionActive || !isSetupAcknowledged || clean.isBlank()) {
@@ -1199,6 +1211,12 @@ class GeminiLiveSession(
         }
 
         try {
+            val userTextWithContext = if (!emotionTone.isNullOrBlank()) {
+                "[Context: Emotional Tone Instruction: $emotionTone]\n$clean"
+            } else {
+                clean
+            }
+
             val msgJson = JSONObject().apply {
                 put("clientContent", JSONObject().apply {
                     put("turns", JSONArray().apply {
@@ -1206,7 +1224,7 @@ class GeminiLiveSession(
                             put("role", "user")
                             put("parts", JSONArray().apply {
                                 put(JSONObject().apply {
-                                    put("text", clean)
+                                    put("text", userTextWithContext)
                                 })
                             })
                         })
@@ -1216,7 +1234,7 @@ class GeminiLiveSession(
             }
 
             val sent = ws.send(msgJson.toString())
-            Log.i(TAG, "[3] AUDIO/SPEECH SENT - Sent to Gemini Live: '$clean' (sent=$sent)")
+            Log.i(TAG, "[3] AUDIO/SPEECH SENT - Sent to Gemini Live: '$clean' (tone='$emotionTone', sent=$sent)")
             return sent
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send user speech to Gemini Live: ${e.message}", e)
@@ -1225,8 +1243,8 @@ class GeminiLiveSession(
     }
 
     /**
-     * Bridges an incoming notification event to the active Gemini Live/Puck session.
-     * Instructs the existing WebSocket session to speak the announcement naturally via Puck voice.
+     * Bridges an incoming notification event to the active Gemini Live session.
+     * Instructs the existing WebSocket session to speak the announcement naturally via the active voice identity (Puck or Leda).
      */
     fun sendNotificationAnnouncement(promptText: String = "Boss, notification aya hai. Sunaun?"): Boolean {
         val ws = webSocket
@@ -1235,7 +1253,11 @@ class GeminiLiveSession(
             return false
         }
 
-        interruptPlayback()
+        // Avoid interrupting active speech for routine notification prompt
+        if (!isAudioStreaming()) {
+            interruptPlayback()
+        }
+
         try {
             val msgJson = JSONObject().apply {
                 put("clientContent", JSONObject().apply {
@@ -1244,7 +1266,7 @@ class GeminiLiveSession(
                             put("role", "user")
                             put("parts", JSONArray().apply {
                                 put(JSONObject().apply {
-                                    put("text", "System Event: A new notification has arrived. Please immediately speak to the user naturally in your Puck voice: \"$promptText\"")
+                                    put("text", "System Event: A new notification has arrived. Please immediately speak to the user naturally in your $currentVoiceName voice: \"$promptText\"")
                                 })
                             })
                         })
@@ -1323,6 +1345,7 @@ class GeminiLiveSession(
     }
 
     fun interruptPlayback() {
+        playbackEpoch++
         audioQueue.clear()
         isAudioPlaying = false
         isTurnGenerationComplete = false
@@ -1381,6 +1404,7 @@ class GeminiLiveSession(
     fun release() {
         disconnect()
         playbackJob?.cancel()
+        fifoExecutor.shutdown()
         try {
             audioTrack?.stop()
             audioTrack?.release()

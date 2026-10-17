@@ -475,37 +475,37 @@ private fun FloatingHolographicOrb(
         label = "OrbPulse"
     )
 
-    // State-based dynamic colors
+    // State-based dynamic colors (Gold primary identity with tasteful state accents)
     val (primaryColor, secondaryColor, ringColor) = when (uiState.state) {
         AffyState.LISTENING -> Triple(
+            Color(0xFFFFD700), // Metallic Gold
             Color(0xFF00F0FF), // Cyber Cyan
-            Color(0xFF0066FF), // Electric Blue
-            Color(0xFF00F0FF).copy(alpha = 0.7f)
+            Color(0xFF00F0FF).copy(alpha = 0.75f)
         )
         AffyState.THINKING -> Triple(
-            Color(0xFFB000FF), // Neon Purple
-            Color(0xFF00F0FF), // Cyber Cyan
-            Color(0xFF9D00FF).copy(alpha = 0.8f)
+            Color(0xFFFFD700), // Metallic Gold
+            Color(0xFFB000FF), // Cosmic Violet
+            Color(0xFFB000FF).copy(alpha = 0.8f)
         )
         AffyState.SPEAKING -> Triple(
-            Color(0xFF00E676), // Success Green / Glow
-            Color(0xFF00F0FF), // Cyan
-            Color(0xFF00E676).copy(alpha = 0.75f)
+            Color(0xFFFFF4B8), // Champagne Solar Gold
+            Color(0xFF2979FF), // Electric Cosmic Blue
+            Color(0xFFFFD700).copy(alpha = 0.8f)
         )
-        AffyState.EXECUTING -> Triple(
-            Color(0xFFFFB300), // Amber Gold
-            Color(0xFF0066FF), // Electric Blue
-            Color(0xFFFFB300).copy(alpha = 0.7f)
+        AffyState.EXECUTING, AffyState.VERIFYING -> Triple(
+            Color(0xFFFFD700), // Metallic Gold
+            Color(0xFF00E676), // Emerald / Cyan Action
+            Color(0xFF00E5FF).copy(alpha = 0.75f)
         )
         AffyState.ERROR -> Triple(
-            Color(0xFFFF3366),
-            Color(0xFF880022),
-            Color(0xFFFF3366).copy(alpha = 0.7f)
+            Color(0xFFFF5252),
+            Color(0xFFFFB300),
+            Color(0xFFFF5252).copy(alpha = 0.75f)
         )
         else -> Triple(
-            Color(0xFF00C8FF), // Electric Cyan Calm
-            Color(0xFF003399), // Deep Blue
-            Color(0xFF00C8FF).copy(alpha = 0.35f)
+            Color(0xFFFFD700), // Calm Golden Universe
+            Color(0xFFD48806), // Deep Burnished Gold
+            Color(0xFFFFD700).copy(alpha = 0.45f)
         )
     }
 

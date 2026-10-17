@@ -196,11 +196,25 @@ class ContactResolver(private val context: Context) {
         }
 
         val strippedQuery = cleanContactQuery(rawClean)
-        val cleanQuery = normalizeName(if (strippedQuery.isNotBlank()) strippedQuery else rawClean)
-        val rawCandidates = mutableListOf<ContactCandidate>()
+        val candidateQuery = if (strippedQuery.isNotBlank()) strippedQuery else rawClean
+        val cleanQuery = normalizeName(candidateQuery)
+        if (cleanQuery.isBlank() || (cleanQuery.length < 2 && !rawClean.matches(Regex("\\d+")))) {
+            AffyDiagnostics.logContactStage("CONTACT_QUERY", details = "Query too short or blank after cleaning: '$cleanQuery'", isSuccess = false)
+            return ContactResolutionResult.NotFound
+        }
+
+        data class RawContactRecord(
+            val contactId: Long,
+            val name: String,
+            val number: String,
+            val typeLabel: String
+        )
+
+        val rawCandidates = mutableListOf<RawContactRecord>()
 
         try {
             val projection = arrayOf(
+                ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
                 ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
                 ContactsContract.CommonDataKinds.Phone.NUMBER,
                 ContactsContract.CommonDataKinds.Phone.TYPE,
@@ -216,12 +230,14 @@ class ContactResolver(private val context: Context) {
             )
 
             cursor?.use {
+                val idIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.CONTACT_ID)
                 val nameIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
                 val numberIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
                 val typeIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.TYPE)
                 val labelIndex = it.getColumnIndex(ContactsContract.CommonDataKinds.Phone.LABEL)
 
                 while (it.moveToNext()) {
+                    val id = if (idIndex >= 0) it.getLong(idIndex) else 0L
                     val name = if (nameIndex >= 0) it.getString(nameIndex) else null
                     val number = if (numberIndex >= 0) it.getString(numberIndex) else null
                     val typeInt = if (typeIndex >= 0) it.getInt(typeIndex) else ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE
@@ -233,7 +249,7 @@ class ContactResolver(private val context: Context) {
                     ).toString()
 
                     if (!name.isNullOrBlank() && !number.isNullOrBlank()) {
-                        rawCandidates.add(ContactCandidate(name.trim(), number.trim(), typeLabel.ifBlank { "Mobile" }))
+                        rawCandidates.add(RawContactRecord(id, name.trim(), number.trim(), typeLabel.ifBlank { "Mobile" }))
                     }
                 }
             }
@@ -266,32 +282,32 @@ class ContactResolver(private val context: Context) {
             return ContactResolutionResult.NotFound
         }
 
-        // DEDUPLICATE RAW ENTRIES ACROSS SYNC ACCOUNTS (Google, SIM, WhatsApp)
-        val deduplicatedRaw = mutableListOf<ContactCandidate>()
+        // Deduplicate phone numbers for the same person across sync accounts (e.g. Google, WhatsApp, SIM)
+        val deduplicatedRecords = mutableListOf<RawContactRecord>()
         val seenUniqueKeys = mutableSetOf<String>()
-        for (cand in rawCandidates) {
-            val normNum = normalizePhoneNumber(cand.phoneNumber)
+        for (rec in rawCandidates) {
+            val normNum = normalizePhoneNumber(rec.number)
             val coreNum = getCoreNumber(normNum)
-            val key = "${normalizeName(cand.name)}_$coreNum"
-            if (seenUniqueKeys.add(key)) {
-                deduplicatedRaw.add(cand.copy(phoneNumber = normNum))
+            val personKey = if (rec.contactId > 0L) "id_${rec.contactId}_$coreNum" else "${normalizeName(rec.name)}_$coreNum"
+            if (seenUniqueKeys.add(personKey)) {
+                deduplicatedRecords.add(rec.copy(number = normNum))
             }
         }
 
         // MATCH PRIORITY:
-        // 1. Exact normalized full name match
-        // 2. Exact full-word token match (e.g. query "Ali" matches contact "Ali", or token "Ali" in "Ali Raza")
-        // 3. All query words match tokens in contact name
-        // 4. Substring match (fallback only if higher tiers empty)
+        // 1. Exact normalized full name match ("Ali" == "Ali", "Hamza Khan" == "Hamza Khan")
+        // 2. Exact word token match ("Ali" in "Ali Raza")
+        // 3. All query words match tokens ("Ali Raza" matches "Ali Raza Khan")
+        // 4. Prefix match (query length >= 3 matches start of token, e.g. "Hamz" matches "Hamza")
 
-        val exactFullMatches = mutableListOf<ContactCandidate>()
-        val exactWordMatches = mutableListOf<ContactCandidate>()
-        val allWordsMatches = mutableListOf<ContactCandidate>()
-        val substringMatches = mutableListOf<ContactCandidate>()
+        val exactFullMatches = mutableListOf<RawContactRecord>()
+        val exactWordMatches = mutableListOf<RawContactRecord>()
+        val allWordsMatches = mutableListOf<RawContactRecord>()
+        val prefixMatches = mutableListOf<RawContactRecord>()
 
         if (isSelfQuery) {
             val selfKeywords = listOf("me", "myself", "my number", "you", "apna", "personal", "owner", "mera")
-            for (candidate in deduplicatedRaw) {
+            for (candidate in deduplicatedRecords) {
                 val candNormName = normalizeName(candidate.name)
                 if (selfKeywords.any { candNormName.contains(it) }) {
                     exactFullMatches.add(candidate)
@@ -301,7 +317,7 @@ class ContactResolver(private val context: Context) {
 
         val queryWords = cleanQuery.split(" ").filter { it.isNotBlank() }
 
-        for (candidate in deduplicatedRaw) {
+        for (candidate in deduplicatedRecords) {
             val candNormName = normalizeName(candidate.name)
             val candTokens = candNormName.split(" ").filter { it.isNotBlank() }
 
@@ -309,10 +325,10 @@ class ContactResolver(private val context: Context) {
                 exactFullMatches.add(candidate)
             } else if (candTokens.contains(cleanQuery)) {
                 exactWordMatches.add(candidate)
-            } else if (queryWords.isNotEmpty() && queryWords.all { qw -> candTokens.any { it == qw || it.startsWith(qw) } }) {
+            } else if (queryWords.size > 1 && queryWords.all { qw -> candTokens.any { ct -> ct == qw || (qw.length >= 3 && ct.startsWith(qw)) } }) {
                 allWordsMatches.add(candidate)
-            } else if (candNormName.contains(cleanQuery) || cleanQuery.contains(candNormName)) {
-                substringMatches.add(candidate)
+            } else if (cleanQuery.length >= 3 && candTokens.any { it.startsWith(cleanQuery) }) {
+                prefixMatches.add(candidate)
             }
         }
 
@@ -320,10 +336,11 @@ class ContactResolver(private val context: Context) {
             exactFullMatches.isNotEmpty() -> exactFullMatches
             exactWordMatches.isNotEmpty() -> exactWordMatches
             allWordsMatches.isNotEmpty() -> allWordsMatches
-            else -> substringMatches
+            prefixMatches.isNotEmpty() -> prefixMatches
+            else -> emptyList()
         }
 
-        Log.i(TAG, "[WA_CONTACT_MATCHES] query='$cleanQuery' exactFull=${exactFullMatches.size} exactWord=${exactWordMatches.size} allWords=${allWordsMatches.size} substring=${substringMatches.size} selectedPool=${poolToUse.size}")
+        Log.i(TAG, "[WA_CONTACT_MATCHES] query='$cleanQuery' exactFull=${exactFullMatches.size} exactWord=${exactWordMatches.size} allWords=${allWordsMatches.size} prefix=${prefixMatches.size} selectedPool=${poolToUse.size}")
 
         if (poolToUse.isEmpty()) {
             AffyDiagnostics.logContactStage(
@@ -334,53 +351,69 @@ class ContactResolver(private val context: Context) {
             return ContactResolutionResult.NotFound
         }
 
-        // Deduplicate pool by core number
-        val uniqueTargets = mutableListOf<ContactCandidate>()
-        val seenCoreNumbers = mutableSetOf<String>()
-
-        for (candidate in poolToUse) {
-            val normalizedNum = normalizePhoneNumber(candidate.phoneNumber)
-            val coreNum = getCoreNumber(normalizedNum)
-            if (coreNum.length >= 7) {
-                if (seenCoreNumbers.add(coreNum)) {
-                    uniqueTargets.add(ContactCandidate(candidate.name, normalizedNum, candidate.typeLabel))
-                }
-            } else {
-                val digitsOnly = candidate.phoneNumber.replace(Regex("[^0-9+]"), "")
-                if (seenCoreNumbers.add(digitsOnly)) {
-                    uniqueTargets.add(ContactCandidate(candidate.name, candidate.phoneNumber, candidate.typeLabel))
-                }
-            }
+        // Group matching records by individual human person (by contactId or normalized name)
+        val personGroups = poolToUse.groupBy { rec ->
+            if (rec.contactId > 0L) "id_${rec.contactId}" else normalizeName(rec.name)
         }
 
-        Log.i(TAG, "[WA_CONTACT_MATCH_COUNT] query='$cleanQuery' uniqueTargetCount=${uniqueTargets.size}")
-
-        AffyDiagnostics.logContactStage(
-            "CONTACT_UNIQUE_TARGETS",
-            details = "Filtered down to ${uniqueTargets.size} unique target numbers"
-        )
+        Log.i(TAG, "[WA_CONTACT_PERSON_COUNT] query='$cleanQuery' uniquePersonCount=${personGroups.size}")
 
         return when {
-            uniqueTargets.isEmpty() -> ContactResolutionResult.NotFound
-            uniqueTargets.size == 1 -> {
-                val selected = uniqueTargets[0]
-                AffyDiagnostics.logContactStage(
-                    "CONTACT_SELECTED",
-                    details = "Resolved unique contact: ${selected.name} (${selected.phoneNumber})",
-                    isSuccess = true
-                )
-                ContactResolutionResult.Single(selected.name, selected.phoneNumber)
+            personGroups.isEmpty() -> ContactResolutionResult.NotFound
+
+            // Exactly ONE distinct person matched
+            personGroups.size == 1 -> {
+                val personRecords = personGroups.values.first()
+                val distinctNumbers = mutableListOf<RawContactRecord>()
+                val seenCores = mutableSetOf<String>()
+                for (rec in personRecords) {
+                    val core = getCoreNumber(rec.number)
+                    if (seenCores.add(core)) {
+                        distinctNumbers.add(rec)
+                    }
+                }
+
+                if (distinctNumbers.size == 1) {
+                    val selected = distinctNumbers[0]
+                    AffyDiagnostics.logContactStage(
+                        "CONTACT_SELECTED",
+                        details = "Resolved unique single contact: ${selected.name} (${selected.number})",
+                        isSuccess = true
+                    )
+                    ContactResolutionResult.Single(selected.name, selected.number)
+                } else {
+                    // Single person has multiple distinct phone numbers (e.g. Mobile and Work)
+                    val candidates = distinctNumbers.map {
+                        ContactCandidate(it.name, it.number, it.typeLabel)
+                    }
+                    AffyDiagnostics.logContactStage(
+                        "CONTACT_SELECTED",
+                        details = "Single contact ${candidates[0].name} has ${candidates.size} phone numbers: ${candidates.map { it.displayString }}",
+                        isSuccess = false,
+                        failureReason = "MULTIPLE_NUMBERS_SAME_CONTACT"
+                    )
+                    ContactResolutionResult.Multiple(candidates)
+                }
             }
+
+            // Multiple distinct people matched (e.g. "Ali Khan" and "Ali Raza")
             else -> {
-                val sortedCandidates = uniqueTargets.sortedWith(
+                val candidates = mutableListOf<ContactCandidate>()
+                for ((_, records) in personGroups) {
+                    // Pick the primary/mobile number for each distinct person
+                    val primaryRecord = records.firstOrNull { it.typeLabel.equals("mobile", ignoreCase = true) }
+                        ?: records.first()
+                    candidates.add(ContactCandidate(primaryRecord.name, primaryRecord.number, primaryRecord.typeLabel))
+                }
+
+                val sortedCandidates = candidates.sortedWith(
                     compareBy<ContactCandidate> { normalizeName(it.name) != cleanQuery }
                         .thenBy { it.name.lowercase() }
-                        .thenBy { it.typeLabel.lowercase() }
                 ).take(5)
 
                 AffyDiagnostics.logContactStage(
                     "CONTACT_SELECTED",
-                    details = "Multiple targets found (${sortedCandidates.size}): ${sortedCandidates.map { it.displayString }}",
+                    details = "Multiple distinct contacts found (${sortedCandidates.size}): ${sortedCandidates.map { it.displayString }}",
                     isSuccess = false,
                     failureReason = "MULTIPLE_CONTACTS"
                 )
